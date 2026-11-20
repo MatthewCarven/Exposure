@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+
+# Virtual environments
+.venv*/
+venv/
+
+# Exposure session files (the agent writes <pid>.json under %LOCALAPPDATA%\exposure\sessions,
+# but never commit one if it lands in the tree)
+sessions/
+*.session.json
+*.json.tmp
+
+# Logs and captured output
+*.log
+*.out
+*.err
+
+# Recordings
+*.wav
+
+# Claude Code
+.claude/
