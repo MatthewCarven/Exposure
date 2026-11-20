@@ -316,6 +316,22 @@ Design changes it forces:
 - **Blocked targets confirmed:** a process in `time.sleep(60)` never ran the script; an idle Tk window only ran it when its own `after()` fired.
 - Small fixes: bootstrap as a stub that loads the agent from a real file (proper tracebacks), clean up stale session files.
 
+### M1 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M1-results.md`.
+- **`exposure` package and CLI**: `ps`, `attach`, `ping`, `threads`, `stack`,
+  `ls`, `show`, `scope`, `release`, `detach`, `sessions`.
+- **Core pieces**: handle table, safe inspection (no target code runs), and the
+  reachable / explicit / both scopes from `exposure.toml` and
+  `exposure.expose()`. Token auth and a bootstrap stub with an expiry.
+- **Tests**: 34, passing on Windows and Linux.
+- **PySynthRack with audio on**: browsing caused 0 xruns and left the frame
+  time unchanged, even with commands sent back to back and the duty cap off.
+  The 2 ms slices with GIL-releasing sleeps are what protect the audio. The
+  xrun pressure back-off triggers when dropouts happen for other reasons.
+- **Carried to M2**: handle-table growth (weak refs or a cap), and an idle
+  timeout for abandoned sessions.
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.

@@ -170,6 +170,8 @@ def main(argv=None) -> int:
         if not info.get("reused"):
             note = f" (pid {info['launcher']} is a venv launcher)" if "launcher" in info else ""
             print(f"attached to {c.pid} in {info['attach_ms']} ms{note}", file=sys.stderr)
+        for w in info.get("warnings", ()):
+            print(f"exposure: warning: {w}", file=sys.stderr)
         with c:
             if args.cmd == "attach":
                 res = c.scope()

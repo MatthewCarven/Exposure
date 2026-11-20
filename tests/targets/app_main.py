@@ -69,6 +69,9 @@ def main():
         exposure.expose(items, name="items", read_only=True)
     tick = 0
     print("ready", flush=True)
+    if "--block" in sys.argv:   # one long C-level sleep: no bytecode runs
+        time.sleep(float(sys.argv[sys.argv.index("--block") + 1]))
+        print("woke", flush=True)
     end = time.monotonic() + seconds
     while time.monotonic() < end:
         tick += 1

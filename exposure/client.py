@@ -23,9 +23,21 @@ from . import procs, protocol
 PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 BOOTSTRAP = '''\
-# Exposure bootstrap, run by sys.remote_exec. Generated; safe to delete.
+# Exposure bootstrap, run by sys.remote_exec. Generated; it deletes itself
+# when it runs. If the client gave up waiting (the target was blocked in C),
+# a late run finds the attempt expired and exits quietly.
 def _exposure_boot():
+    import json
+    import os
     import sys
+    import time
+    config = json.loads({config!r})
+    try:
+        os.remove(config["boot_file"])
+    except OSError:
+        pass
+    if time.time() > config["expires"]:
+        return
     agent = getattr(sys, "_exposure_agent", None)
     if agent is not None:
         try:
@@ -33,9 +45,7 @@ def _exposure_boot():
         except BaseException:
             pass
         return
-    import json
     root = {root!r}
-    config = json.loads({config!r})
     added = root not in sys.path
     try:
         if added:
@@ -175,7 +185,19 @@ class Client:
             sock, hello = _connect(pid)
             if sock is not None:
                 info["reused"] = True
-                return cls(pid, sock, hello, info)
+                c = cls(pid, sock, hello, info)
+                asked = {"entry": entry, "scope": scope, "pressure": pressure,
+                         "duty": float(duty) if duty else None,
+                         "policy": os.path.abspath(policy) if policy else None}
+                asked = {k: v for k, v in asked.items() if v is not None}
+                if asked:
+                    running = c.ping().get("config", {})
+                    differ = [k for k, v in asked.items() if running.get(k) != v]
+                    if differ:
+                        info["warnings"] = [
+                            f"agent already running with different {', '.join(differ)}; "
+                            "options only apply when injecting (detach first to change them)"]
+                return c
         # stale or absent session: inject
         for p in (protocol.session_path(pid), protocol.error_path(pid)):
             try:
@@ -183,7 +205,9 @@ class Client:
             except OSError:
                 pass
         protocol.ensure_session_dir()
-        config = {"error_file": protocol.error_path(pid)}
+        boot = protocol.boot_path(pid)
+        config = {"error_file": protocol.error_path(pid), "boot_file": boot,
+                  "expires": time.time() + wait + 1.0}
         if entry:
             config["entry"] = entry
         if policy:
@@ -194,7 +218,6 @@ class Client:
             config["pressure"] = pressure
         if duty:
             config["duty"] = float(duty)
-        boot = protocol.boot_path(pid)
         protocol.write_private(boot, BOOTSTRAP.format(root=PACKAGE_ROOT,
                                                       config=json.dumps(config)))
         t0 = time.perf_counter()
@@ -206,26 +229,22 @@ class Client:
         except (OSError, RuntimeError) as exc:
             raise AttachError(f"sys.remote_exec failed for {pid}: {exc} (remote debugging "
                               "may be disabled in the target, or it isn't Python 3.14+)") from None
+        # The boot file is left in place on every path: the stub deletes it
+        # when it runs, and a late run after we give up sees it has expired.
         deadline = t0 + wait
-        try:
-            while time.perf_counter() < deadline:
-                if os.path.exists(protocol.error_path(pid)):
-                    with open(protocol.error_path(pid), encoding="utf-8") as f:
-                        raise AttachError("the agent failed to start in the target:\n" + f.read())
-                if os.path.exists(protocol.session_path(pid)):
-                    sock, hello = _connect(pid)
-                    if sock is not None:
-                        info["reused"] = False
-                        info["attach_ms"] = round((time.perf_counter() - t0) * 1000, 1)
-                        return cls(pid, sock, hello, info)
-                if not procs.is_alive(pid):
-                    raise AttachError(f"process {pid} exited while attaching")
-                time.sleep(0.01)
-        finally:
-            try:
-                os.remove(boot)
-            except OSError:
-                pass
+        while time.perf_counter() < deadline:
+            if os.path.exists(protocol.error_path(pid)):
+                with open(protocol.error_path(pid), encoding="utf-8") as f:
+                    raise AttachError("the agent failed to start in the target:\n" + f.read())
+            if os.path.exists(protocol.session_path(pid)):
+                sock, hello = _connect(pid)
+                if sock is not None:
+                    info["reused"] = False
+                    info["attach_ms"] = round((time.perf_counter() - t0) * 1000, 1)
+                    return cls(pid, sock, hello, info)
+            if not procs.is_alive(pid):
+                raise AttachError(f"process {pid} exited while attaching")
+            time.sleep(0.01)
         raise AttachError(
             f"no answer from {pid} after {wait:g}s. The target only runs the bootstrap "
             "when it next executes Python bytecode; a process blocked in a long C call "

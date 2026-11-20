@@ -604,6 +604,9 @@ class Agent:
                 "scope": self.scope, "entry": self.entry_spec or "(auto)",
                 "requests": self.requests, "errors": self.errors,
                 "handles": len(self.handles), "budget": self.budget.stats(),
+                "config": {"entry": self.entry_spec, "scope": self.scope,
+                           "pressure": self.pressure_spec, "duty": self.budget.base_duty,
+                           "policy": self.policy.path if self.policy else None},
                 "gil": getattr(sys, "_is_gil_enabled", lambda: True)()}
 
     def cmd_threads(self):

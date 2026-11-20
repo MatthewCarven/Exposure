@@ -142,6 +142,40 @@ def test_stale_session_cleanup(make_target):
         Client.attach(t.pid)
 
 
+def test_boot_file_removes_itself(make_target):
+    t = make_target()
+    with Client.attach(t.pid):
+        pass
+    assert not os.path.exists(protocol.boot_path(t.pid))
+
+
+def test_blocked_target_wakes_after_timeout(make_target):
+    t = make_target("--block", "3")
+    with pytest.raises(AttachError, match="bytecode"):
+        Client.attach(t.pid, wait=0.5)
+    assert os.path.exists(protocol.boot_path(t.pid))   # left for the late run
+    line = t.lines.get(timeout=10)
+    assert line.strip() == "woke"
+    deadline = time.time() + 5
+    while os.path.exists(protocol.boot_path(t.pid)) and time.time() < deadline:
+        time.sleep(0.05)
+    assert not os.path.exists(protocol.boot_path(t.pid))  # the stub ran and expired
+    time.sleep(0.3)
+    assert not os.path.exists(protocol.session_path(t.pid))  # no agent started late
+    assert t.proc.poll() is None
+    assert not os.path.exists(protocol.error_path(t.pid))
+
+
+def test_reuse_warns_about_new_options(make_target):
+    t = make_target()
+    Client.attach(t.pid).close()
+    with Client.attach(t.pid, scope="explicit") as c:
+        assert c.attach_info["reused"] is True
+        assert "scope" in c.attach_info["warnings"][0]
+    with Client.attach(t.pid, scope="reachable") as c:
+        assert "warnings" not in c.attach_info
+
+
 def test_ps_lists_target(make_target):
     if not (sys.platform == "win32" or sys.platform.startswith("linux")):
         pytest.skip("ps is implemented for Windows and Linux")

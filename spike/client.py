@@ -23,7 +23,7 @@ BOOTSTRAP = os.path.join(HERE, "bootstrap.py")
 
 def session_file(pid):
     base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-    return os.path.join(base, "exposure", "sessions", f"{pid}.json")
+    return os.path.join(base, "exposure", "spike-sessions", f"{pid}.json")
 
 
 def python_children(pid):

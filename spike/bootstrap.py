@@ -16,7 +16,7 @@
 def _exposure_bootstrap():
     import sys
 
-    existing = getattr(sys, "_exposure_agent", None)
+    existing = getattr(sys, "_exposure_spike_agent", None)
     if existing is not None:
         try:
             existing.ensure_alive()
@@ -50,7 +50,7 @@ def _exposure_bootstrap():
 
     def session_dir():
         base = os.environ.get("LOCALAPPDATA") or os.path.expanduser("~")
-        return os.path.join(base, "exposure", "sessions")
+        return os.path.join(base, "exposure", "spike-sessions")
 
     def stats(samples):
         if not samples:
@@ -326,8 +326,8 @@ def _exposure_bootstrap():
             except BaseException:
                 pass
             try:
-                if getattr(sys, "_exposure_agent", None) is self:
-                    del sys._exposure_agent
+                if getattr(sys, "_exposure_spike_agent", None) is self:
+                    del sys._exposure_spike_agent
             except BaseException:
                 pass
 
@@ -579,7 +579,7 @@ def _exposure_bootstrap():
             return {"detaching": True, "thread": self.thread.name}
 
     agent = Agent()
-    sys._exposure_agent = agent
+    sys._exposure_spike_agent = agent
     agent.thread.start()
 
 
