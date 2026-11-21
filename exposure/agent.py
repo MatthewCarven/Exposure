@@ -40,6 +40,7 @@ import linecache
 
 from . import executor as executor_mod
 from . import probes as probes_mod
+from . import reloader as reloader_mod
 from . import inspector, paths, policy as policy_mod, protocol
 
 AGENT_VERSION = "0.1.0"
@@ -251,6 +252,7 @@ class Agent:
         self.probes = probes_mod.Probes(on_break=self._probe_break)
         self.frame_breaks = {}        # id -> (watcher fn, text)
         self.snaps = {}               # name -> snapshot (snap / diff)
+        self.reloads = []             # Reload records, newest last (reload --undo)
         self.repeats = {}
         self._repeat_ids = 0
         self._captures = {}           # job id -> _Capture, read by _job_report
@@ -1847,7 +1849,7 @@ class Agent:
                                   "sets [safety] eval = true")
         if mode == "auto":
             try:
-                compile(source, "<probe>", "eval")
+                compile(source, "<probe>", "eval", dont_inherit=True)
                 mode = "eval"
             except SyntaxError:
                 mode = "exec"
@@ -1856,7 +1858,7 @@ class Agent:
         with self._state_lock:
             self._eval_seq += 1
             fname = f"<exposure-eval-{self._eval_seq}>"
-        code = compile(source, fname, mode)
+        code = compile(source, fname, mode, dont_inherit=True)   # no __future__ leak
         linecache.cache[fname] = (len(source), None, source.splitlines(True) or ["\n"], fname)
         extras = {"__exposure_h__": lambda n: self.handles.get(int(n))[0]}
         frame_obj = None
@@ -2012,8 +2014,8 @@ class Agent:
                 confirmed=False):
         self._check_code_probe(confirmed)
         codes, line = self._codes_at(location)
-        code = compile(expr, f"<exposure-log>", "eval")
-        cond = compile(when, "<exposure-log-when>", "eval") if when else None
+        code = compile(expr, "<exposure-log>", "eval", dont_inherit=True)
+        cond = compile(when, "<exposure-log-when>", "eval", dont_inherit=True) if when else None
         sys.audit("exposure.eval", f"log {location}: {expr}")
         p = probes_mod.Probe("log", str(location), codes, line=line, expr=code, when=cond,
                              every=every, rate=rate, source=expr,
@@ -2049,7 +2051,8 @@ class Agent:
             else:
                 self._check_writable()
             codes, line = self._codes_at(location)
-            cond = compile(when, "<exposure-break-when>", "eval") if when else None
+            cond = (compile(when, "<exposure-break-when>", "eval", dont_inherit=True)
+                    if when else None)
             p = probes_mod.Probe("break", str(location), codes, line=line, when=cond,
                                  rate=1000.0, source=when or "")
             self.probes.add(p)
@@ -2057,7 +2060,7 @@ class Agent:
         if not when:
             raise ValueError("give a FILE:LINE, a --when condition, or both")
         self._check_code_probe(confirmed)
-        code = compile(when, "<exposure-break-when>", "eval")
+        code = compile(when, "<exposure-break-when>", "eval", dont_inherit=True)
         frame = self._entry_frame()
         ex = self._main_executor()
         bid = next(probes_mod.Probe._ids)
@@ -2203,6 +2206,46 @@ class Agent:
                            - len(removed)},
                 "seconds_apart": round(new["time"] - old["time"], 2),
                 "truncated": old["truncated"] or new["truncated"]}
+
+    # =====================================================================================
+    # M6: hot reload
+    # =====================================================================================
+
+    def cmd_reload(self, module, undo=False, values=False, on=None, timeout=30.0,
+                   confirmed=False):
+        """Re-run a module's current source and rebind its functions and classes
+        in place (see exposure.reloader). Runs between frames by default."""
+        self._check_code_probe(confirmed)        # it runs the module's code: eval's gate
+        if undo:
+            rec = None
+            for r in reversed(self.reloads):
+                if module in (None, "", r.module.__name__):
+                    rec = r
+                    break
+            if rec is None:
+                raise LookupError("nothing to undo" + (f" for {module}" if module else ""))
+            self.reloads.remove(rec)
+            job = self._run(rec.undo, f"reload --undo {rec.module.__name__}",
+                            self._executor(on), timeout)
+            return self._job_report(job)
+        mod = sys.modules.get(module)
+        if mod is None:
+            raise LookupError(f"module {module!r} isn't loaded (sys.modules)")
+        rec = reloader_mod.Reload(mod)
+        sys.audit("exposure.eval", f"reload {module}")
+
+        def fn():
+            return rec.apply(values=bool(values))
+
+        job = self._run(fn, f"reload {module}", self._executor(on), timeout)
+        if job.done.is_set() and job.ok:
+            self.reloads.append(rec)
+            del self.reloads[:-20]
+            out = self._job_report(job)
+            out["report"] = job.result
+            out.pop("result", None)
+            return out
+        return self._job_report(job)
 
     def cmd_scratch(self, clear=False):
         if clear:

@@ -204,6 +204,14 @@ def build_parser():
     s.add_argument("a")
     s.add_argument("b", nargs="?", help="another snapshot (default: now)")
     sub.add_parser("snaps", parents=[parent], help="list snapshots")
+    s = sub.add_parser("reload", parents=[parent], help="hot reload: re-run a module's source "
+                                                        "and rebind its functions in place")
+    s.add_argument("module", nargs="?", help="module name, e.g. game.enemies or __main__")
+    s.add_argument("--undo", action="store_true", help="put the last reload's old code back")
+    s.add_argument("--values", action="store_true",
+                   help="also replace module-level values (default: keep state)")
+    s.add_argument("--yes", "-y", action="store_true")
+    _run_opts(s)
     for name in ("unlog", "untrace", "unbreak", "unprobe"):
         s = sub.add_parser(name, parents=[parent], help="remove a probe (or all)")
         s.add_argument("probe", nargs="?", default="all")
@@ -340,6 +348,24 @@ def print_src(res):
         print("  ... (truncated)")
 
 
+def print_reload(res):
+    if "report" not in res:
+        print_job(res)
+        return
+    r = res["report"]
+    _line(f"reloaded {r['module']} on {res.get('thread')} ({res.get('on')}), "
+          f"blocked {res.get('blocked_ms')} ms")
+    for key, label in (("rebound", "rebound"), ("added", "added"), ("skipped", "skipped"),
+                       ("removed_in_source", "gone from the source"),
+                       ("updated_values", "values replaced"),
+                       ("kept_values", "values kept (use --values to replace)"),
+                       ("running", "running now (old code until they return)")):
+        if r.get(key):
+            _line(f"  {label}: {', '.join(r[key])}")
+    if not r.get("rebound") and not r.get("added"):
+        _line("  nothing changed")
+
+
 def print_diff(res):
     n = res["counts"]
     _line(f"{res['target']}: {res['a']} -> {res['b']} ({res['seconds_apart']} s apart): "
@@ -463,6 +489,8 @@ def print_result(cmd, res):
         print_doc(res)
     elif cmd == "diff":
         print_diff(res)
+    elif cmd == "reload":
+        print_reload(res)
     elif cmd == "snaps":
         if not res:
             print("no snapshots")
@@ -628,6 +656,14 @@ def main(argv=None) -> int:
                 res = c.diff(args.a, args.b)
             elif args.cmd == "snaps":
                 res = c.snaps()
+            elif args.cmd == "reload":
+                what = f"undo the last reload of {args.module or 'any module'}" if args.undo \
+                    else f"re-run {args.module}'s source in pid {c.pid}"
+                if not args.yes and cfg["client"]["confirm"] and not _confirm(what):
+                    print("not done", file=sys.stderr)
+                    return 1
+                res = c.reload(args.module, undo=args.undo, values=args.values, on=args.on,
+                               timeout=args.timeout, confirmed=True)
             elif args.cmd in ("unlog", "untrace", "unbreak", "unprobe"):
                 res = c.unprobe(args.probe)
             elif args.cmd == "set":

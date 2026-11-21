@@ -37,6 +37,7 @@ Panels:   watch PATH...  tweak PATH [STEP]  preset NAME  presets      (Ctrl+C re
 Probes:   log FILE:LINE EXPR [--when C]  trace FUNC  break FILE:LINE | break when COND
           logs (stream)  probes  unlog|untrace|unbreak [ID|all]
 Compare:  snap NAME PATH  diff NAME [OTHER]  snaps
+Reload:   reload MODULE [--values]  reload --undo
 Python:   !EXPR | eval EXPR | exec CODE (alone: type lines, blank line runs) | py (toggle)
           frame PATH (run Python in that frame; `frame` alone = scratch)  scratch [clear]
 Session:  confirm on|off  release [@N...]  detach  quit
@@ -387,6 +388,20 @@ class Shell(cmd.Cmd):
     def do_diff(self, arg):
         parts = arg.split()
         self._show("diff", self.c.diff(parts[0], parts[1] if len(parts) > 1 else None))
+
+    def do_reload(self, arg):
+        parts = arg.split()
+        undo = "--undo" in parts
+        values = "--values" in parts
+        names = [x for x in parts if not x.startswith("--")]
+        module = names[0] if names else None
+        if not undo and not module:
+            self.stdout.write("usage: reload MODULE [--values] | reload [MODULE] --undo\n")
+            return
+        if not self._ask(f"reload {module or ''}{' --undo' if undo else ''}"):
+            self.stdout.write("not done\n")
+            return
+        self._show("reload", self.c.reload(module, undo=undo, values=values, confirmed=True))
 
     def do_snaps(self, arg):
         self._show("snaps", self.c.snaps())

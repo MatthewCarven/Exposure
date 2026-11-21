@@ -271,3 +271,135 @@ def test_print_diff(capsys):
                     "counts": {"changed": 1, "added": 1, "removed": 0, "same": 4}})
     out = capsys.readouterr().out
     assert "~ player.hp: 100 -> 75" in out and "+ player.new: 1" in out
+
+
+# -- part 4: hot reload ----------------------------------------------------------------------------
+
+MOD_V1 = '''counter = 0
+
+
+def compute(x):
+    return x + 1
+
+
+class Game:
+    def __init__(self):
+        self.level = 1
+
+    def speed(self):
+        return 10
+
+    @staticmethod
+    def label():
+        return "v1"
+'''
+
+MOD_V2 = '''counter = 0
+
+
+def compute(x):
+    return x + 100
+
+
+def bonus():
+    return 7
+
+
+class Game:
+    def __init__(self):
+        self.level = 1
+
+    def speed(self):
+        return 99
+
+    def boost(self):
+        return bonus() * 2
+
+    @staticmethod
+    def label():
+        return "v2"
+'''
+
+MAIN = '''import os
+import sys
+import time
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reloadable  # noqa: E402
+from reloadable import compute  # noqa: E402
+
+
+def helper():
+    return "{tag}"
+
+
+def main():
+    game = reloadable.Game()
+    result = speed = tag = None
+    print("ready", flush=True)
+    end = time.monotonic() + 60
+    while time.monotonic() < end:
+        result = compute(1)
+        speed = game.speed()
+        tag = helper()
+        reloadable.counter += 1
+        time.sleep(0.005)
+
+
+if __name__ == "__main__":
+    main()
+'''
+
+
+@needs_314
+def test_hot_reload(make_target, tmp_path):
+    (tmp_path / "reloadable.py").write_text(MOD_V1, encoding="utf-8")
+    main_py = tmp_path / "reload_main.py"
+    main_py.write_text(MAIN.replace("{tag}", "old"), encoding="utf-8")
+    t = make_target(script=str(main_py))
+
+    def vals(c, *names):
+        v = {x["path"]: x.get("preview") for x in c.sample(list(names))["values"]}
+        return [v[n] for n in names]
+
+    with Client.attach(t.pid) as c:
+        assert vals(c, "result", "speed", "tag") == ["2", "10", "'old'"]
+        (tmp_path / "reloadable.py").write_text(MOD_V2, encoding="utf-8")
+        with pytest.raises(Exception, match="confirmed"):
+            c.reload("reloadable")
+        r = c.reload("reloadable", confirmed=True)
+        rep = r["report"]
+        # (__init__ only moved down the file; its line numbers changed, so it is rebound too)
+        assert {"compute", "Game.speed", "Game.label"} <= set(rep["rebound"])
+        assert set(rep["added"]) == {"bonus", "Game.boost"}
+        assert rep["kept_values"] == ["counter"]
+        time.sleep(0.1)
+        assert vals(c, "result", "speed") == ["101", "99"]     # from-import and instance
+        assert c.call("game.boost()")["result"]["preview"] == "14"
+        assert c.call("reloadable.Game.label()")["result"]["preview"] == "'v2'"
+        n = int(vals(c, "reloadable.counter")[0])
+        assert n > 10                                           # state kept
+        # __main__ too: main() keeps running its old code, helper() is rebound
+        main_py.write_text(MAIN.replace("{tag}", "new"), encoding="utf-8")
+        r = c.reload("__main__", confirmed=True)
+        assert "helper" in r["report"]["rebound"] and "main" not in r["report"]["rebound"]
+        time.sleep(0.1)
+        assert vals(c, "tag") == ["'new'"]
+        # undo, newest first
+        c.reload("__main__", undo=True, confirmed=True)
+        c.reload("reloadable", undo=True, confirmed=True)
+        time.sleep(0.1)
+        assert vals(c, "result", "speed", "tag") == ["2", "10", "'old'"]
+        r = c.call("game.boost()")                              # the added method is gone
+        assert r["state"] == "error" and "AttributeError" in r["error"]
+
+
+@needs_314
+def test_eval_does_not_inherit_agent_future_flags(make_target):
+    """The agent's `from __future__ import annotations` must not leak into code it
+    compiles for the target (eval, reload, logpoints)."""
+    t = make_target(script="game_loop.py")
+    with Client.attach(t.pid) as c:
+        c.eval("def annotated(x: int): pass", confirmed=True)
+        r = c.eval("annotated.__annotations__['x'] is int", confirmed=True)
+        assert r["result"]["preview"] == "True"

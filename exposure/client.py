@@ -416,6 +416,11 @@ class Client:
             time.sleep(poll)
         return n
 
+    def reload(self, module, *, undo=False, values=False, on=None, timeout=None,
+               confirmed=False):
+        return self.request("reload", module=module, undo=undo or None, values=values or None,
+                            on=on, timeout=timeout, confirmed=confirmed)
+
     # -- M6: snapshots ---------------------------------------------------------------------
     def snap(self, name, target, *, depth=None):
         return self.request("snap", name=name, target=exprs.parse_target(target), depth=depth)
