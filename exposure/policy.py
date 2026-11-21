@@ -133,7 +133,7 @@ def parse(data: dict, path: str | None = None) -> Policy:
     for name, spec in raw_presets.items():
         if not isinstance(spec, dict):
             raise PolicyError(f"[presets.{name}] must be a table")
-        unknown = set(spec) - {"watch", "tweak", "rate", "step"}
+        unknown = set(spec) - {"watch", "tweak", "rate", "step", "range", "sliders"}
         if unknown:
             raise PolicyError(f"[presets.{name}]: unknown key(s) {sorted(unknown)}")
         preset = {}
@@ -152,11 +152,46 @@ def parse(data: dict, path: str | None = None) -> Policy:
                     isinstance(v, (int, float)) for v in steps.values()):
                 raise PolicyError(f"[presets.{name}] step must map paths to numbers")
             preset["step"] = dict(steps)
+        if "range" in spec:
+            ranges = spec["range"]
+            if not isinstance(ranges, dict) or not all(
+                    isinstance(v, list) and len(v) == 2 and all(isinstance(x, (int, float))
+                                                                for x in v)
+                    for v in ranges.values()):
+                raise PolicyError(f"[presets.{name}] range must map paths to [low, high]")
+            preset["range"] = {k: list(v) for k, v in ranges.items()}
+        if "sliders" in spec:
+            preset["sliders"] = [_slider(name, i, x) for i, x in enumerate(spec["sliders"])]
         presets[name] = preset
     safety = parse_safety(data.get("safety", {}) or {})
     return Policy(path=path, scope=scope, entry=agent.get("entry"),
                   pressure=agent.get("pressure"), rules=rules, agent=dict(agent),
                   actions=actions, presets=presets, safety=safety)
+
+
+def _slider(preset, i, spec):
+    """A panel slider: shows ``read``; moving it calls action ``action`` with
+    ``args`` + the new value (e.g. PySynthRack's param MODULE NAME VALUE), or
+    sets ``set`` (a path) directly."""
+    where = f"[presets.{preset}] sliders[{i}]"
+    if not isinstance(spec, dict) or not isinstance(spec.get("read"), str):
+        raise PolicyError(f"{where}: needs read = \"path\"")
+    if not (isinstance(spec.get("action"), str) or isinstance(spec.get("set"), str)):
+        raise PolicyError(f"{where}: needs action = \"name\" or set = \"path\"")
+    args = spec.get("args", [])
+    if not isinstance(args, list):
+        raise PolicyError(f"{where}: args must be a list")
+    rng = spec.get("range")
+    if rng is not None and not (isinstance(rng, list) and len(rng) == 2):
+        raise PolicyError(f"{where}: range must be [low, high]")
+    out = {"label": spec.get("label") or spec["read"], "read": spec["read"],
+           "range": rng, "step": spec.get("step")}
+    if isinstance(spec.get("action"), str):
+        # args travel as literal source text: strings keep their quotes
+        out.update(action=spec["action"], args=[repr(a) for a in args])
+    else:
+        out["set"] = spec["set"]
+    return out
 
 
 def parse_safety(spec) -> dict:

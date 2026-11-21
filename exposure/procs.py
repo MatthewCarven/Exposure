@@ -335,3 +335,16 @@ def build_mismatch(version):
     return (f"the target runs a regular Python ({version}) and this client is free-threaded; "
             "CPython only injects between matching builds. Run Exposure with a regular "
             "3.14 interpreter. Once attached, any client can connect.")
+
+
+def not_python_reason(pid):
+    """A message if ``pid`` is certainly not running Python, else None (unknown or
+    yes). Only Windows can tell for sure: an interpreter loads python3XX.dll,
+    while Linux builds often link libpython statically."""
+    if sys.platform != "win32":
+        return None
+    mods = _win_modules(pid)
+    if mods is None or any(_PYDLL.match(m) for m in mods):
+        return None
+    name = next((n for p, _pp, n in _win_processes() if p == pid), "?")
+    return f"pid {pid} ({name}) isn't running Python (no python3XX.dll loaded)"

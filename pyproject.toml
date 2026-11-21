@@ -41,6 +41,9 @@ exposure = "exposure.cli:main"
 [tool.setuptools]
 packages = ["exposure"]
 
+[tool.setuptools.package-data]
+exposure = ["panel.html"]
+
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 markers = ["stress: long-running stress tests, skipped by default (run with -m stress)"]

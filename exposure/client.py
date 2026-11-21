@@ -245,7 +245,11 @@ class Client:
                             f"agent already running with different {', '.join(differ)}; "
                             "options only apply when injecting (detach first to change them)"]
                 return c
-        # stale or absent session: inject (needs matching interpreter builds)
+        # stale or absent session: inject (needs a Python of a matching build)
+        if version is None:
+            why = procs.not_python_reason(pid)
+            if why:
+                raise AttachError(why)
         mismatch = procs.build_mismatch(version)
         if mismatch:
             raise AttachError(f"can't inject into pid {pid}: {mismatch}")

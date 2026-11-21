@@ -30,3 +30,28 @@ audio = "self._on_toggle_audio"  # start / stop audio
 watch = ["self.backend._xruns", "self.backend._dsp_load", "self.backend._dsp_load_peak",
          "self.backend._audio_levels", "len(self.patch.modules)", "self._buffer_size"]
 rate = 10
+
+# exposure panel PID --policy examples/pysynthrack.toml --preset panel
+# A browser panel: engine readouts with graphs, and sliders that move the
+# oscillator's amp and the output gain through _mirror_param (model, backend
+# and widget together). Module ids are hello_sine's: 1 = Osc 1, 2 = Output.
+[presets.panel]
+watch = ["self.backend._xruns", "self.backend._dsp_load", "self.backend._dsp_load_peak",
+         "self.backend._running", "self._buffer_size", "len(self.patch.modules)"]
+rate = 10
+
+[[presets.panel.sliders]]
+label = "Osc 1 amp"
+read = "self.patch.modules[1].params['amp']"
+action = "param"
+args = [1, "amp"]
+range = [0, 1]
+step = 0.01
+
+[[presets.panel.sliders]]
+label = "Output gain"
+read = "self.patch.modules[2].params['gain']"
+action = "param"
+args = [2, "gain"]
+range = [0, 1]
+step = 0.01

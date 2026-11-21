@@ -403,3 +403,112 @@ def test_eval_does_not_inherit_agent_future_flags(make_target):
         c.eval("def annotated(x: int): pass", confirmed=True)
         r = c.eval("annotated.__annotations__['x'] is int", confirmed=True)
         assert r["result"]["preview"] == "True"
+
+
+# -- part 5: browser panel ---------------------------------------------------------------------
+
+PANEL_POLICY = '''
+[actions]
+heal = "player.heal"
+
+[presets.hud]
+watch = ["frame", "player.hp", "len(player.pos)"]
+tweak = ["player.speed"]
+range = { "player.speed" = [0, 10] }
+sliders = [ { label = "heal by", read = "player.hp", action = "heal", args = [], range = [0, 50] } ]
+'''
+
+
+def _http(port, method, path, token=None, body=None, host=None, ctype="application/json",
+          origin=None):
+    import http.client
+    import json as _json
+    conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+    headers = {"Host": host or f"127.0.0.1:{port}"}
+    if token:
+        headers["X-Exposure-Token"] = token
+    if origin:
+        headers["Origin"] = origin
+    data = None
+    if body is not None:
+        data = _json.dumps(body).encode()
+        headers["Content-Type"] = ctype
+    conn.request(method, path, body=data, headers=headers)
+    r = conn.getresponse()
+    raw = r.read()
+    hdrs = dict(r.getheaders())
+    conn.close()
+    try:
+        payload = _json.loads(raw)
+    except ValueError:
+        payload = raw
+    return r.status, payload, hdrs
+
+
+@needs_314
+def test_panel_http_api(make_target, tmp_path):
+    from exposure.webpanel import PanelServer
+    (tmp_path / "exposure.toml").write_text(PANEL_POLICY, encoding="utf-8")
+    t = make_target(script="game_loop.py", cwd=str(tmp_path))
+    with Client.attach(t.pid) as c:
+        panel = PanelServer(c, preset="hud").start()
+        try:
+            port, tok = panel.port, panel.token
+            # security
+            assert _http(port, "GET", "/")[0] == 403                          # no token
+            assert _http(port, "GET", f"/?token={tok}x")[0] == 403
+            st, body, hdrs = _http(port, "GET", f"/?token={tok}")
+            assert st == 200 and b"<title>Exposure panel</title>" in body
+            assert not any(k.lower().startswith("access-control") for k in hdrs)
+            assert _http(port, "GET", "/api/state", tok, host="evil.example:80")[0] == 403
+            assert _http(port, "GET", "/api/state", tok, host=f"localhost:{port}")[0] == 200
+            assert _http(port, "POST", "/api/pause", tok, {}, ctype="text/plain")[0] == 415
+            assert _http(port, "POST", "/api/pause", tok, {},
+                         origin="http://evil.example")[0] == 403
+            assert _http(port, "PUT", "/api/pause", tok)[0] in (403, 405)
+            # config and state
+            st, cfg, _ = _http(port, "GET", "/api/config", tok)
+            assert cfg["watch"] == ["frame", "player.hp", "len(player.pos)"]
+            assert [s["label"] for s in cfg["sliders"]] == ["heal by", "player.speed"]
+            assert cfg["sliders"][1]["range"] == [0, 10] and cfg["actions"] == ["heal"]
+            st, state, _ = _http(port, "GET", "/api/state", tok)
+            vals = {v["path"]: v["preview"] for v in state["values"]}
+            assert vals["player.hp"] == "100" and vals["len(player.pos)"] == "2"
+            # changes
+            r = _http(port, "POST", "/api/set", tok, {"target": "player.hp", "value": "40"})[1]
+            assert r["new"] == "40"
+            r = _http(port, "POST", "/api/slider", tok, {"index": 0, "value": "15"})[1]
+            assert r["result"]["preview"] == "55"                             # heal(15)
+            r = _http(port, "POST", "/api/slider", tok, {"index": 1, "value": 2.5})[1]
+            assert r["new"] == "2.5"                                          # set speed
+            r = _http(port, "POST", "/api/do", tok, {"action": "heal", "values": ["5"]})[1]
+            assert r["result"]["preview"] == "60"
+            assert _http(port, "POST", "/api/pause", tok, {})[1]["paused"] is True
+            r = _http(port, "POST", "/api/step", tok, {"n": 2})[1]
+            assert r["advanced"] == 2
+            assert _http(port, "POST", "/api/resume", tok, {})[1]["paused"] is False
+            st, ev, _ = _http(port, "GET", "/api/events?since=0", tok)
+            assert st == 200 and "events" in ev
+            assert _http(port, "POST", "/api/nope", tok, {})[0] == 400
+        finally:
+            panel.stop()
+
+
+def test_slider_policy_parse():
+    from exposure import policy
+    p = policy.parse({"presets": {"x": {"sliders": [
+        {"read": "a.b", "action": "param", "args": [1, "amp"], "range": [0, 1]},
+        {"read": "c", "set": "c"}]}}})
+    s0, s1 = p.presets["x"]["sliders"]
+    assert s0["args"] == ["1", "'amp'"] and s0["action"] == "param"
+    assert s1["set"] == "c"
+    with pytest.raises(policy.PolicyError):
+        policy.parse({"presets": {"x": {"sliders": [{"read": "a"}]}}})
+
+
+def test_example_policy_parses():
+    from exposure import policy
+    p = policy.load(os.path.join(ROOT, "examples", "pysynthrack.toml"))
+    assert p.entry == "pysynthrack.ui.app:App.run" and set(p.actions) == {"param", "audio"}
+    s = p.presets["panel"]["sliders"]
+    assert [x["args"] for x in s] == [["1", "'amp'"], ["2", "'gain'"]]

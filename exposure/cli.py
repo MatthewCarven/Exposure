@@ -204,6 +204,10 @@ def build_parser():
     s.add_argument("a")
     s.add_argument("b", nargs="?", help="another snapshot (default: now)")
     sub.add_parser("snaps", parents=[parent], help="list snapshots")
+    s = sub.add_parser("panel", parents=[parent], help="open a debug panel in the browser")
+    s.add_argument("--preset", help="[presets.NAME] to show (watch list, sliders)")
+    s.add_argument("--port", type=int, default=0, help="local port (default: any free one)")
+    s.add_argument("--no-open", action="store_true", help="print the URL, don't open a browser")
     s = sub.add_parser("reload", parents=[parent], help="hot reload: re-run a module's source "
                                                         "and rebind its functions in place")
     s.add_argument("module", nargs="?", help="module name, e.g. game.enemies or __main__")
@@ -656,6 +660,9 @@ def main(argv=None) -> int:
                 res = c.diff(args.a, args.b)
             elif args.cmd == "snaps":
                 res = c.snaps()
+            elif args.cmd == "panel":
+                from . import webpanel
+                return webpanel.run(c, args.preset, args.port, not args.no_open)
             elif args.cmd == "reload":
                 what = f"undo the last reload of {args.module or 'any module'}" if args.undo \
                     else f"re-run {args.module}'s source in pid {c.pid}"
