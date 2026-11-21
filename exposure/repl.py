@@ -135,6 +135,12 @@ class Shell(cmd.Cmd):
     def default(self, line):
         if line.startswith("!"):
             return self._python(line[1:], "auto")
+        first = line.split()[0].lower()
+        if "-m exposure" in line or first.endswith(("python", "python.exe")):
+            self.stdout.write("that's a PowerShell command, and you're already in the exposure "
+                              "shell: type `quit` to go back to PowerShell (or `detach` to "
+                              "also remove the agent, e.g. to attach with other options)\n")
+            return
         self.stdout.write(f"unknown command {line.split()[0]!r}; `help` lists them, "
                           "`!expr` runs Python\n")
 

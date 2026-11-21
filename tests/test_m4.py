@@ -195,7 +195,8 @@ def test_shell_script(make_target):
     script = "\n".join([
         "help", "ls", "call where()", "!player.hp + 1", "set player.hp 50",
         "set player.speed = 2.0", "undo", "history", "py", "player.hp * 3", "py",
-        "frame main", "!mode", "frame", "find type:Player", "nosuch", "ls nope", "quit", ""])
+        "frame main", "!mode", "frame", "find type:Player", "nosuch", "ls nope",
+        r".venv\Scripts\python -m exposure shell 1 --entry App.run", "quit", ""])
     out = io.StringIO()
     with Client.attach(t.pid) as c:
         sh = Shell(c, stdin=io.StringIO(script), stdout=out, confirm=False, page=False)
@@ -205,6 +206,7 @@ def test_shell_script(make_target):
     assert "'MainThread'" in text and "-> 101" in text
     assert "100  ->  50" in text and "1.5  ->  2.0" in text
     assert "-> 150" in text                       # py mode: player.hp is 50 * 3
+    assert "already in the exposure shell" in text   # a pasted PowerShell command
     assert "-> 'normal'" in text                  # frame main: the local `mode`
     assert "unknown command 'nosuch'" in text and "error:" in text
 
