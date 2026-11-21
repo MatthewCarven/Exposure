@@ -455,8 +455,11 @@ class Agent:
             if detaching and not self.served:
                 # stop advertising *before* answering: once the client reads
                 # "detaching", the session file is already gone and new hellos
-                # are refused. The socket closes after the reply (closing it
-                # wakes the accept loop, whose cleanup drops open connections).
+                # are refused. This connection takes itself off the list the
+                # cleanup closes (setting stop lets the accept loop exit and
+                # clean up while we're still replying); it closes itself.
+                with self._state_lock:
+                    self._conns.discard(conn)
                 self.stop.set()
                 self._remove_files()
             try:

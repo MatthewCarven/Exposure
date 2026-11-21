@@ -11,9 +11,10 @@ import re
 import sys
 from dataclasses import dataclass, field
 
-_PYDLL = re.compile(r"^python3(\d+)t?\.dll$", re.I)
-_PYLIB = re.compile(r"libpython3\.(\d+)t?\.so")
-_PYEXE = re.compile(r"python3\.(\d+)t?$")
+# the optional "t" marks a free-threaded build: python314t.dll -> "3.14t"
+_PYDLL = re.compile(r"^python3(\d+)(t?)\.dll$", re.I)
+_PYLIB = re.compile(r"libpython3\.(\d+)(t?)\.so")
+_PYEXE = re.compile(r"python3\.(\d+)(t?)$")
 
 
 @dataclass
@@ -36,7 +37,7 @@ class ProcInfo:
             return "no (remote debug disabled)"
         if self.version is None:
             return "unknown"
-        major, minor = (int(x) for x in self.version.split("."))
+        major, minor = (int(x) for x in self.version.rstrip("t").split("."))
         if (major, minor) < (3, 14):
             return "no (needs 3.14+)"
         return "yes"
@@ -181,14 +182,14 @@ def _linux_info(info: ProcInfo):
             for line in f:
                 m = _PYLIB.search(line)
                 if m:
-                    info.version = f"3.{m.group(1)}"
+                    info.version = f"3.{m.group(1)}{m.group(2)}"
                     break
     except OSError:
         info.notes.append("maps not readable")
     if info.version is None and info.exe:
         m = _PYEXE.search(os.path.basename(info.exe))
         if m:
-            info.version = f"3.{m.group(1)}"
+            info.version = f"3.{m.group(1)}{m.group(2)}"
     try:
         with open(f"/proc/{pid}/environ", "rb") as f:
             env = f.read().split(b"\0")
@@ -233,7 +234,7 @@ def _win_dll_version(pid):
     for m in mods or ():
         mm = _PYDLL.match(m)
         if mm:
-            return f"3.{mm.group(1)}"   # python314.dll -> 3.14
+            return f"3.{mm.group(1)}{mm.group(2).lower()}"   # python314t.dll -> 3.14t
     return None
 
 
@@ -300,3 +301,27 @@ def list_python() -> list[ProcInfo]:
             _linux_info(info)
             out.append(info)
     return sorted(out, key=lambda i: i.pid)
+
+
+def client_free_threaded() -> bool:
+    import sysconfig
+    return bool(sysconfig.get_config_var("Py_GIL_DISABLED"))
+
+
+def build_mismatch(version):
+    """A message if sys.remote_exec can't cross between this client's build and
+    the target's (free-threaded vs regular), else None."""
+    if not version:
+        return None
+    target_ft = version.endswith("t")
+    if target_ft == client_free_threaded():
+        return None
+    if target_ft:
+        return (f"the target runs a free-threaded Python ({version}) and this client is a "
+                "regular build; CPython only injects between matching builds. Run Exposure "
+                "with a 3.14t interpreter (e.g. `uv tool install --python 3.14t "
+                "git+https://github.com/MatthewCarven/Exposure`). Once a matching client "
+                "has attached, any client can connect.")
+    return (f"the target runs a regular Python ({version}) and this client is free-threaded; "
+            "CPython only injects between matching builds. Run Exposure with a regular "
+            "3.14 interpreter. Once attached, any client can connect.")

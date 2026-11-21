@@ -209,7 +209,7 @@ class Client:
         version = procs.python_version(pid)
         if version is not None:
             info["python"] = version
-            major, minor = (int(x) for x in version.split("."))
+            major, minor = (int(x) for x in version.rstrip("t").split("."))
             if (major, minor) < (3, 14):
                 raise AttachError(
                     f"pid {pid} runs Python {version}; attaching needs Python 3.14+ in the "
@@ -245,7 +245,10 @@ class Client:
                             f"agent already running with different {', '.join(differ)}; "
                             "options only apply when injecting (detach first to change them)"]
                 return c
-        # stale or absent session: inject
+        # stale or absent session: inject (needs matching interpreter builds)
+        mismatch = procs.build_mismatch(version)
+        if mismatch:
+            raise AttachError(f"can't inject into pid {pid}: {mismatch}")
         for p in (protocol.session_path(pid), protocol.error_path(pid)):
             try:
                 os.remove(p)

@@ -48,17 +48,42 @@ an interactive shell and `eval`. Hardening comes next.
 
 ## Requirements
 
-- Python 3.14 or newer, for both the client and the target.
-- Tested on Windows 11 and Linux. `ps` doesn't support macOS yet.
+- Python 3.14 or newer, for both the client and the target. Free-threaded
+  3.14t works too, but injecting needs the same kind of build on both sides:
+  use a 3.14t client for a 3.14t target. Once the agent is in, any client can
+  connect.
+- Tested on Windows 11 and Linux, in CI on both. `ps` doesn't support macOS
+  yet.
 - The client must run as the same user as the target, with the usual
   permission to debug that process (on Linux, check `ptrace_scope`).
 - No dependencies. The agent uses only the standard library, so nothing is
   added to the target's environment.
 
+## Installing
+
+Install from GitHub. It isn't published on PyPI yet; if it is, the name will
+be `exposure-debugger`, because `exposure` is taken.
+
+```
+pipx install git+https://github.com/MatthewCarven/Exposure
+uv tool install git+https://github.com/MatthewCarven/Exposure
+```
+
+On Windows, add the `shell` extra for Tab completion and history in
+`exposure shell`:
+
+```
+uv tool install "exposure-debugger[shell] @ git+https://github.com/MatthewCarven/Exposure"
+```
+
+For free-threaded targets, install it under a 3.14t interpreter too:
+`uv tool install --python 3.14t git+https://github.com/MatthewCarven/Exposure`.
+
+From a checkout, `python -m exposure` works without installing anything.
+
 ## Using it
 
-Run it from a checkout with `python -m exposure`, or `pip install .` to get
-the `exposure` command. Any command that needs the agent injects it first.
+Any command that needs the agent injects it first.
 
 ```
 exposure ps                                   # Python processes, attachable?
@@ -260,8 +285,24 @@ processes you own and trust.
   written to a session file in the user's local app-data folder.
 - The explicit scope is a guard rail against mistakes, not a lock. Anyone who
   can run `sys.remote_exec` against your process can inject any code they like.
-- A stricter mode is planned for a later milestone: the target turns remote
-  debugging off and opts in with `exposure.serve(policy=...)`.
+- **Strict mode** is for when the explicit scope should be a real boundary.
+  The program turns remote debugging off (`PYTHON_DISABLE_REMOTE_DEBUG=1` or
+  `-X disable-remote-debug`), so nothing can be injected, and starts the
+  agent itself:
+
+  ```python
+  import exposure
+  exposure.serve(policy="exposure.toml")
+  ```
+
+  - The policy is loaded right there and a client can't change it.
+  - `eval`/`exec` are off.
+  - Only the policy's and `exposure.expose()`'s items are reachable.
+  - A client's `detach` ends its session, but the agent keeps serving.
+- **Audit:** `[agent] audit_log = "path"` (or `serve(audit_log=...)`) appends
+  one JSON line per change. `sys.audit` events (`exposure.attach`,
+  `exposure.call`, `exposure.set`, `exposure.eval`, `exposure.detach`) let the
+  program's own audit hooks see, or refuse, anything Exposure does.
 
 ## Licence
 

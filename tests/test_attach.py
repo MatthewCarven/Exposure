@@ -11,6 +11,9 @@ from exposure.client import AttachError, Client, RemoteError, clean_stale, list_
 
 pytestmark = needs_314
 
+# what ps / python_version should report for a target run by this interpreter
+EXPECTED_VERSION = f"3.{sys.version_info.minor}" + ("t" if procs.client_free_threaded() else "")
+
 
 def names(res):
     return {e["name"]: e for e in res["entries"]}
@@ -197,7 +200,7 @@ def test_python_version_of_target(make_target):
     if not (sys.platform == "win32" or sys.platform.startswith("linux")):
         pytest.skip("version detection is implemented for Windows and Linux")
     t = make_target()
-    assert procs.python_version(t.pid) == f"3.{sys.version_info.minor}"
+    assert procs.python_version(t.pid) == EXPECTED_VERSION
     assert procs.resolve_launcher(t.pid) == t.pid
 
 
@@ -208,7 +211,7 @@ def test_ps_lists_target(make_target):
     found = {p.pid: p for p in procs.list_python()}
     assert t.pid in found
     p = found[t.pid]
-    assert p.version == f"3.{sys.version_info.minor}"
+    assert p.version == EXPECTED_VERSION
     assert p.attachable == "yes"
 
 
@@ -224,3 +227,11 @@ def test_cli_smoke(make_target, capsys):
     assert main(["--json", "ping", str(t.pid)]) == 0
     assert '"agent"' in capsys.readouterr().out
     assert main(["detach", str(t.pid)]) == 0
+
+
+def test_build_mismatch_is_refused_clearly(make_target, monkeypatch):
+    t = make_target()
+    other = "3.14" if procs.client_free_threaded() else "3.14t"
+    monkeypatch.setattr(procs, "python_version", lambda pid: other)
+    with pytest.raises(AttachError, match="only injects between matching builds"):
+        Client.attach(t.pid)
