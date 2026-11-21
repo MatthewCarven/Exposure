@@ -36,6 +36,16 @@ def test_parse_call_rejects(bad):
 # -- against a game-style loop -------------------------------------------------------------
 
 @needs_314
+def test_first_job_reports_where_it_ran(make_target):
+    t = make_target(script="game_loop.py")
+    with Client.attach(t.pid) as c:      # no executors() first: mode picked on submit
+        r = c.call("where()")
+        assert r["on"] == "loop" and r["thread"] == "MainThread"
+        assert c.call("where()", on="agent")["on"] == "agent"
+        assert [j["on"] for j in c.jobs()] == ["loop", "agent"]
+
+
+@needs_314
 def test_calls_run_between_frames(make_target):
     t = make_target(script="game_loop.py")
     with Client.attach(t.pid) as c:

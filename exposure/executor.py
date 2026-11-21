@@ -340,6 +340,7 @@ class ThreadExecutor:
         with self.lock:
             if self.mode is None:
                 self.mode = self._pick_mode()
+            job.where = self.mode      # known only now, on the first submit
             self.queue.append(job)
             self._sync()
             holding = self.holding
@@ -448,6 +449,7 @@ class AgentExecutor:
     mode = "agent"
 
     def submit(self, job: Job):
+        job.where = "agent"
         threading.Thread(target=job.run, name=f"exposure-call-{job.id}", daemon=True).start()
         return job
 
