@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
+import shutil
 import sys
 
 from . import client as client_mod
@@ -166,17 +168,64 @@ def build_parser():
 
 # -- printing -------------------------------------------------------------------------
 
-def _table(rows, headers):
+def _fit(text, width):
+    text = str(text)
+    return text if len(text) <= width else text[:max(1, width - 1)] + "…"
+
+
+def _table(rows, headers, flex=None):
+    """Print an aligned table that fits the terminal. ``flex`` is the column
+    that gives way when it doesn't (default: the widest)."""
     if not rows:
         return
     widths = [len(h) for h in headers]
     for r in rows:
         for i, c in enumerate(r):
-            widths[i] = min(max(widths[i], len(str(c))), 70)
+            widths[i] = max(widths[i], len(str(c)))
+    term = term_width()
+    over = sum(widths) + 2 * (len(widths) - 1) - term
+    if over > 0 and flex is not None:            # the flexible column gives way first
+        cut = min(over, widths[flex] - 10)
+        widths[flex] -= max(0, cut)
+        over -= max(0, cut)
+    while over > 0:                              # then the widest, down to 4 each
+        i = widths.index(max(widths))
+        if widths[i] <= 4:
+            break
+        cut = min(over, widths[i] - 4, max(1, widths[i] // 4))
+        widths[i] -= cut
+        over -= cut
     fmt = "  ".join("{:<%d}" % w for w in widths)
-    print(fmt.format(*headers))
+    print(fmt.format(*[_fit(h, w) for h, w in zip(headers, widths)]).rstrip())
     for r in rows:
-        print(fmt.format(*[str(c)[:70] for c in r]).rstrip())
+        print(fmt.format(*[_fit(c, w) for c, w in zip(r, widths)]).rstrip())
+
+
+def term_width() -> int:
+    """Columns to fit output into: the terminal's, or 100 when piped."""
+    real = sys.__stdout__   # the shell pages captured output, so ask the real one
+    if real is not None and real.isatty():
+        return max(40, shutil.get_terminal_size((100, 40)).columns - 1)
+    try:
+        return max(40, int(os.environ["COLUMNS"]) - 1)
+    except (KeyError, ValueError):
+        return 100
+
+
+def _line(text):
+    print(_fit(text, term_width()))
+
+
+def _short_path(path, keep=3):
+    parts = str(path).replace("\\", "/").split("/")
+    return path if len(parts) <= keep else "…/" + "/".join(parts[-keep:])
+
+
+def _short_kind(kind):
+    for prefix, short in (("policy:", "policy"), ("expose:", "exposed")):
+        if str(kind).startswith(prefix):
+            return short
+    return kind
 
 
 def _perm_str(perm):
@@ -197,15 +246,15 @@ def print_ls(res):
         e = res.get("entry")
         if e:
             more = f", {e['matches']} matches" if e.get("matches", 1) > 1 else ""
-            print(f"entry {e['function']} {e['handle']} ({e['file']}:{e['line']}, "
+            _line(f"entry {e['function']} {e['handle']} ({_short_path(e['file'])}:{e['line']}, "
                   f"thread {e['thread']}{more})  scope: {res['scope']}")
         elif res.get("entry_missing"):
-            print(f"entry {res['entry_missing']!r} not on any stack  scope: {res['scope']}")
+            _line(f"entry {res['entry_missing']!r} not on any stack  scope: {res['scope']}")
     else:
-        print(f"{res['target']}  {res['preview']}")
-    rows = [(e.get("handle", ""), e["name"], e["kind"], e["preview"], _perm_str(e.get("perm")))
-            for e in res["entries"]]
-    _table(rows, ["handle", "name", "kind", "value", "perm"])
+        _line(f"{res['target']}  {res['preview']}")
+    rows = [(e.get("handle", ""), e["name"], _short_kind(e["kind"]), _perm_str(e.get("perm")),
+             e["preview"]) for e in res["entries"]]
+    _table(rows, ["handle", "name", "kind", "perm", "value"], flex=4)
     if res.get("more"):
         nxt = res["offset"] + len(res["entries"])
         print(f"... {res['total'] - nxt} more (use --offset {nxt})")
@@ -259,7 +308,7 @@ def print_job(res):
     print(head)
     if "result" in res:
         r = res["result"]
-        print(f"  -> {r.get('handle', '')} {r['preview']}".replace("->  ", "-> "))
+        _line(f"  -> {r.get('handle', '')} {r['preview']}".replace("->  ", "-> "))
     if "new" in res:
         print(f"  {res['old']}  ->  {res['new']}   (change {res['change']}; `undo` reverts)")
     if res.get("output"):
@@ -293,7 +342,7 @@ def print_result(cmd, res):
     elif cmd in ("call", "set", "do", "result", "nudge"):
         print_job(res)
     elif cmd == "find":
-        print(f"{res['query']} via {res['via']}: {len(res['results'])} found, "
+        _line(f"{res['query']} via {res['via']}: {len(res['results'])} found, "
               f"{res['scanned']} objects scanned in {res['ms']} ms"
               + (" (truncated)" if res["truncated"] else ""))
         _table([(e.get("handle", ""), e.get("path") or e["name"], e["preview"])
