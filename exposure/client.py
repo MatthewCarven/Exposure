@@ -183,6 +183,15 @@ class Client:
         info["pid"] = pid
         if not procs.is_alive(pid):
             raise AttachError(f"no process with pid {pid}")
+        version = procs.python_version(pid)
+        if version is not None:
+            info["python"] = version
+            major, minor = (int(x) for x in version.split("."))
+            if (major, minor) < (3, 14):
+                raise AttachError(
+                    f"pid {pid} runs Python {version}; attaching needs Python 3.14+ in the "
+                    "target (sys.remote_exec, PEP 768). Run the program with a 3.14 "
+                    "interpreter (a packaged .exe embeds the Python it was built with).")
         if reuse:
             sock, hello = _connect(pid)
             if sock is not None:

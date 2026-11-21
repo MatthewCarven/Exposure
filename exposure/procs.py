@@ -225,13 +225,43 @@ def python_children(pid: int) -> list[int]:
     return [p for p, pp, name in procs if pp == pid and name.lower().startswith("python")]
 
 
+def _win_dll_version(pid):
+    """'3.14' if the process has python314.dll loaded, None if none/unreadable."""
+    if pid == 0:   # a module snapshot of pid 0 means "this process"
+        return None
+    mods = _win_modules(pid)
+    for m in mods or ():
+        mm = _PYDLL.match(m)
+        if mm:
+            return f"3.{mm.group(1)}"   # python314.dll -> 3.14
+    return None
+
+
+def python_version(pid: int) -> str | None:
+    """The target's Python version ("3.12") when it can be read, else None."""
+    if sys.platform == "win32":
+        return _win_dll_version(pid)
+    if sys.platform.startswith("linux"):
+        info = ProcInfo(pid, 0, "")
+        _linux_info(info)
+        return info.version
+    return None
+
+
 def resolve_launcher(pid: int) -> int:
-    """If ``pid`` is a Windows venv launcher, return its interpreter child."""
+    """Follow a Windows launcher to the process that actually runs Python.
+
+    Covers a venv's ``Scripts\\python.exe`` (it re-spawns the base interpreter)
+    and a PyInstaller one-file exe (its bootloader runs the app in a child
+    process of the same name). Returns ``pid`` unchanged otherwise.
+    """
     if sys.platform != "win32":
         return pid
-    mods = _win_modules(pid)
-    if mods is not None and any(_PYDLL.match(m) for m in mods):
-        return pid  # it is an interpreter itself
+    if _win_dll_version(pid):
+        return pid  # it runs Python itself
+    kids = [p for p, pp, _name in _win_processes() if pp == pid and _win_dll_version(p)]
+    if len(kids) == 1:
+        return kids[0]
     kids = python_children(pid)
     return kids[0] if len(kids) == 1 else pid
 
@@ -242,24 +272,26 @@ def list_python() -> list[ProcInfo]:
     if sys.platform == "win32":
         procs = _win_processes()
         for pid, ppid, name in procs:
-            if not name.lower().startswith("python") or pid == me:
+            if pid in (0, me, os.getppid()):   # ourselves and our own venv launcher
                 continue
-            info = ProcInfo(pid, ppid, name, exe=_win_exe(pid))
-            mods = _win_modules(pid)
-            if mods is None:
-                info.notes.append("modules not readable")
-            else:
-                for m in mods:
-                    mm = _PYDLL.match(m)
-                    if mm:
-                        info.version = f"3.{mm.group(1)}"   # python314.dll -> 3.14
-                        break
+            version = _win_dll_version(pid)
+            named = name.lower().startswith("python")
+            if not named and version is None:
+                continue
+            info = ProcInfo(pid, ppid, name, exe=_win_exe(pid), version=version)
+            if not named:
+                info.notes.append("embeds Python (a frozen or packaged app?)")
             out.append(info)
         by_pid = {i.pid: i for i in out}
-        for i in out:
+        names = {pid: name for pid, _pp, name in procs}
+        for i in list(out):
             parent = by_pid.get(i.ppid)
             if parent is not None and parent.version is None:
                 parent.launcher_for = i.pid
+            elif parent is None and names.get(i.ppid, "").lower() == i.name.lower():
+                # a PyInstaller bootloader: same exe, no Python of its own
+                out.append(ProcInfo(i.ppid, 0, i.name, exe=i.exe, launcher_for=i.pid))
+        out.sort(key=lambda x: x.pid)
     elif sys.platform.startswith("linux"):
         for pid, ppid, name in _linux_processes():
             if pid == me or not name.lower().startswith("python"):

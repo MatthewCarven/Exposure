@@ -176,6 +176,21 @@ def test_reuse_warns_about_new_options(make_target):
         assert "warnings" not in c.attach_info
 
 
+def test_old_python_target_is_refused_clearly(make_target, monkeypatch):
+    t = make_target()
+    monkeypatch.setattr(procs, "python_version", lambda pid: "3.12")
+    with pytest.raises(AttachError, match=r"runs Python 3\.12; attaching needs Python 3\.14"):
+        Client.attach(t.pid)
+
+
+def test_python_version_of_target(make_target):
+    if not (sys.platform == "win32" or sys.platform.startswith("linux")):
+        pytest.skip("version detection is implemented for Windows and Linux")
+    t = make_target()
+    assert procs.python_version(t.pid) == f"3.{sys.version_info.minor}"
+    assert procs.resolve_launcher(t.pid) == t.pid
+
+
 def test_ps_lists_target(make_target):
     if not (sys.platform == "win32" or sys.platform.startswith("linux")):
         pytest.skip("ps is implemented for Windows and Linux")
