@@ -39,6 +39,7 @@ import itertools
 import linecache
 
 from . import executor as executor_mod
+from . import probes as probes_mod
 from . import inspector, paths, policy as policy_mod, protocol
 
 AGENT_VERSION = "0.1.0"
@@ -247,6 +248,8 @@ class Agent:
         self._open_conns = 0
         self._conns = set()
         self.pauser = None
+        self.probes = probes_mod.Probes(on_break=self._probe_break)
+        self.frame_breaks = {}        # id -> (watcher fn, text)
         self.repeats = {}
         self._repeat_ids = 0
         self._captures = {}           # job id -> _Capture, read by _job_report
@@ -355,6 +358,16 @@ class Agent:
             except BaseException:
                 pass
         self._routers = []
+        try:                                     # logpoints, traces, breakpoints
+            self.probes.close()
+        except BaseException:
+            pass
+        for fn, _text in list(self.frame_breaks.values()):
+            try:
+                self._main_executor().remove_watcher(fn)
+            except BaseException:
+                pass
+        self.frame_breaks.clear()
         for r in list(self.repeats.values()):   # stop repeated calls
             r["stop"].set()
         if self.pauser is not None:              # never leave the program frozen
@@ -1953,6 +1966,146 @@ class Agent:
         return {"target": target, "file": f, "start": max(1, start),
                 "lines": [ln.rstrip("\n") for ln in lines[:int(limit)]],
                 "truncated": len(lines) > int(limit)}
+
+    # =====================================================================================
+    # M6: logpoints, traces, breakpoints
+    # =====================================================================================
+
+    def _check_code_probe(self, confirmed):
+        """Logpoints and conditional breakpoints run expressions in the target:
+        the same gate as eval."""
+        self._check_writable()
+        if not confirmed:
+            raise PermissionError("logpoints/breakpoints run expressions in the target and "
+                                  "must be confirmed (the client asks first; --yes skips)")
+        if self.strict:
+            raise PermissionError("strict mode: logpoints and conditional breakpoints are off")
+        if self.scope != "reachable" and not self.policy_allows_eval:
+            raise PermissionError(f"{self.scope} scope: logpoints/breakpoints are off unless "
+                                  "the policy sets [safety] eval = true")
+
+    def _stack_codes(self):
+        codes = []
+        for _tid, frames in self._all_stacks():
+            codes += [f.f_code for f in frames]
+        return codes
+
+    def _codes_at(self, location):
+        file, sep, line = str(location).rpartition(":")
+        if not sep or not line.strip().isdigit():
+            raise ValueError("location must be FILE:LINE, e.g. game.py:42 or ui/app.py:511")
+        line = int(line)
+        codes = probes_mod.codes_for_line(file, line, self._stack_codes())
+        if not codes:
+            raise LookupError(f"no function in a loaded module covers {file}:{line} "
+                              "(module-level code that already ran can't be probed)")
+        return codes, line
+
+    def _probe_break(self, probe):
+        try:
+            self._pauser().request()
+        except BaseException:
+            pass
+
+    def cmd_log(self, location, expr, when=None, every=1, rate=20.0, seconds=None,
+                confirmed=False):
+        self._check_code_probe(confirmed)
+        codes, line = self._codes_at(location)
+        code = compile(expr, f"<exposure-log>", "eval")
+        cond = compile(when, "<exposure-log-when>", "eval") if when else None
+        sys.audit("exposure.eval", f"log {location}: {expr}")
+        p = probes_mod.Probe("log", str(location), codes, line=line, expr=code, when=cond,
+                             every=every, rate=rate, source=expr,
+                             until=time.monotonic() + float(seconds) if seconds else None)
+        self.probes.add(p)
+        return p.info()
+
+    def cmd_trace(self, target, rate=20.0, seconds=None):
+        self._check_writable()
+        if self.strict:
+            raise PermissionError("strict mode: tracing is off")
+        obj, _perm = self._resolve(target)
+        if isinstance(obj, types.MethodType):
+            obj = obj.__func__
+        if isinstance(obj, (staticmethod, classmethod)):
+            obj = obj.__func__
+        if not isinstance(obj, types.FunctionType):
+            raise TypeError(f"{target} is a {inspector.type_name(obj)}; trace needs a Python "
+                            "function or method")
+        sys.audit("exposure.call", f"trace {target}")
+        p = probes_mod.Probe("trace", target, [obj.__code__], rate=rate, source=target,
+                             until=time.monotonic() + float(seconds) if seconds else None)
+        self.probes.add(p)
+        return p.info()
+
+    def cmd_break(self, location=None, when=None, keep=False, confirmed=False):
+        """``break FILE:LINE [--when COND]``: pause the main loop at the next frame
+        boundary after that line runs. ``break --when COND`` (no location):
+        check COND once per frame on the main loop and pause when it's true."""
+        if location:
+            if when:
+                self._check_code_probe(confirmed)
+            else:
+                self._check_writable()
+            codes, line = self._codes_at(location)
+            cond = compile(when, "<exposure-break-when>", "eval") if when else None
+            p = probes_mod.Probe("break", str(location), codes, line=line, when=cond,
+                                 rate=1000.0, source=when or "")
+            self.probes.add(p)
+            return p.info()
+        if not when:
+            raise ValueError("give a FILE:LINE, a --when condition, or both")
+        self._check_code_probe(confirmed)
+        code = compile(when, "<exposure-break-when>", "eval")
+        frame = self._entry_frame()
+        ex = self._main_executor()
+        bid = next(probes_mod.Probe._ids)
+        state = {"hits": 0, "checks": 0}
+
+        def check():
+            state["checks"] += 1
+            ns = collections.ChainMap(frame.f_locals, frame.f_globals)
+            try:
+                hit = bool(eval(code, frame.f_globals, ns))
+            except Exception as exc:
+                ex.watchers.remove(check) if check in ex.watchers else None
+                self.frame_breaks.pop(bid, None)
+                self.probes.emit(None, f"break {bid} removed: {when!r} raised "
+                                       f"{type(exc).__name__}: {exc}")
+                return
+            if hit:
+                state["hits"] += 1
+                self.probes.emit(None, f"break {bid}: {when} is true at iteration "
+                                       f"{ex.iterations}; pausing")
+                if not keep and check in ex.watchers:
+                    ex.watchers.remove(check)
+                    self.frame_breaks.pop(bid, None)
+                self._pauser().request()
+
+        ex.add_watcher(check)
+        self.frame_breaks[bid] = (check, when)
+        return {"id": bid, "kind": "break when", "when": when, "keep": bool(keep),
+                "note": "checked once per frame on the main loop"}
+
+    def cmd_probes(self):
+        out = [p.info() for p in self.probes.probes.values()]
+        out += [{"id": bid, "kind": "break when", "spec": text, "enabled": True}
+                for bid, (_fn, text) in self.frame_breaks.items()]
+        return sorted(out, key=lambda x: x["id"])
+
+    def cmd_unprobe(self, probe=None):
+        removed = self.probes.remove(probe)
+        ex = self.executors.get(("main", threading.main_thread().ident))
+        for bid in (list(self.frame_breaks) if probe in (None, "all") else [int(probe)]):
+            entry = self.frame_breaks.pop(bid, None)
+            if entry is not None:
+                if ex is not None:
+                    ex.remove_watcher(entry[0])
+                removed.append(bid)
+        return {"removed": sorted(removed)}
+
+    def cmd_probe_events(self, since=0, limit=500):
+        return self.probes.read(int(since), int(limit))
 
     def cmd_scratch(self, clear=False):
         if clear:

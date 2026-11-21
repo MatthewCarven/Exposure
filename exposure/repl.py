@@ -34,6 +34,8 @@ Change:   call EXPR  set PATH VALUE | set PATH = VALUE  nudge PATH DELTA  undo [
 Jobs:     jobs  result N  every INTERVAL EXPR  repeats  stop [ID|all]
 Loop:     pause [S]  step [N]  resume  frames [N]  executors
 Panels:   watch PATH...  tweak PATH [STEP]  preset NAME  presets      (Ctrl+C returns here)
+Probes:   log FILE:LINE EXPR [--when C]  trace FUNC  break FILE:LINE | break when COND
+          logs (stream)  probes  unlog|untrace|unbreak [ID|all]
 Python:   !EXPR | eval EXPR | exec CODE (alone: type lines, blank line runs) | py (toggle)
           frame PATH (run Python in that frame; `frame` alone = scratch)  scratch [clear]
 Session:  confirm on|off  release [@N...]  detach  quit
@@ -52,6 +54,7 @@ class Shell(cmd.Cmd):
         self.history_len = int(cfg["client"].get("history", 1000))
         self.py_mode = False
         self.frame = None
+        self.stream_seconds = None    # tests set this; interactive use streams until Ctrl+C
         self.page = sys.stdout.isatty() if page is None else page
         self.prompt = self._prompt()
         self.intro = (f"exposure shell on pid {client.pid} "
@@ -308,11 +311,81 @@ class Shell(cmd.Cmd):
     def do_step(self, arg):
         self._show("step", self.c.step(int(arg) if arg.strip() else 1))
 
+    def do_paused(self, arg):
+        self._show("paused", self.c.paused())
+
     def do_frames(self, arg):
         self._show("frames", self.c.frames(int(arg) if arg.strip() else 300))
 
     def do_executors(self, arg):
         self._show("executors", self.c.executors())
+
+    # -- logpoints, traces, breakpoints ----------------------------------------------------------
+    @staticmethod
+    def _split_opt(arg, name):
+        """'EXPR --when COND' -> ('EXPR', 'COND')"""
+        marker = f" --{name} "
+        if marker in f" {arg} ":
+            head, _, tail = f" {arg} ".partition(marker)
+            return head.strip(), tail.strip()
+        return arg.strip(), None
+
+    def _stream(self, seconds=None):
+        self.stdout.write("(streaming; Ctrl+C returns to the prompt)\n")
+        out = self.stdout
+
+        def show(ev):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf):
+                cli.print_event(ev)
+            out.write(buf.getvalue())
+            out.flush()
+
+        try:
+            self.c.stream_events(show, seconds=seconds or self.stream_seconds)
+        except KeyboardInterrupt:
+            self.stdout.write("\n")
+
+    def do_log(self, arg):
+        rest, when = self._split_opt(arg, "when")
+        loc, _, expr = rest.partition(" ")
+        if not expr.strip():
+            self.stdout.write("usage: log FILE:LINE EXPR [--when COND]\n")
+            return
+        if not self._ask(f"logpoint {expr.strip()}" + (f" when {when}" if when else "")):
+            self.stdout.write("not added\n")
+            return
+        res = self.c.log(loc, expr.strip(), when=when, confirmed=True)
+        self._emit(cli.print_probe, res)
+        self._stream()
+
+    def do_trace(self, arg):
+        res = self.c.trace(arg.strip())
+        self._emit(cli.print_probe, res)
+        self._stream()
+
+    def do_break(self, arg):
+        rest, when = self._split_opt(arg, "when")
+        rest, keep = (rest.replace("--keep", "").strip(), True) if "--keep" in rest \
+            else (rest, False)
+        if rest.startswith("when "):            # `break when COND` reads naturally
+            rest, when = "", rest[5:].strip()
+        if when and not self._ask(f"breakpoint condition {when}"):
+            self.stdout.write("not added\n")
+            return
+        res = self.c.break_(rest or None, when=when, keep=keep or None, confirmed=bool(when))
+        self._emit(cli.print_probe, res)
+
+    def do_logs(self, arg):
+        self._stream()
+
+    def do_probes(self, arg):
+        self._show("probes", self.c.probes())
+
+    def do_unlog(self, arg):
+        self._show("unprobe", self.c.unprobe(arg.strip() or "all"))
+
+    do_untrace = do_unbreak = do_unprobe = do_unlog
 
     # -- panels ---------------------------------------------------------------------------------
     def do_watch(self, arg):

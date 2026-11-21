@@ -375,6 +375,47 @@ class Client:
         return self.request("eval", source=exprs.eval_source(source), mode=mode, frame=frame,
                             on=on, timeout=timeout, capture=capture, confirmed=confirmed)
 
+    # -- M6: logpoints, traces, breakpoints ----------------------------------------------
+    def log(self, location, expr, *, when=None, every=None, rate=None, seconds=None,
+            confirmed=False):
+        return self.request("log", location=location, expr=expr, when=when, every=every,
+                            rate=rate, seconds=seconds, confirmed=confirmed)
+
+    def trace(self, target, *, rate=None, seconds=None):
+        return self.request("trace", target=exprs.parse_target(target), rate=rate,
+                            seconds=seconds)
+
+    def break_(self, location=None, *, when=None, keep=None, confirmed=False):
+        return self.request("break", location=location, when=when, keep=keep,
+                            confirmed=confirmed)
+
+    def probes(self):
+        return self.request("probes")
+
+    def unprobe(self, probe="all"):
+        return self.request("unprobe", probe=probe)
+
+    def probe_events(self, since=0, limit=None):
+        return self.request("probe_events", since=since, limit=limit)
+
+    def stream_events(self, on_event, *, since=None, seconds=None, count=None, poll=0.1):
+        """Call ``on_event(event)`` for new probe events until ``seconds`` pass or
+        ``count`` events arrived (or forever; Ctrl+C stops). Returns the count."""
+        if since is None:
+            since = self.probe_events(since=0, limit=0)["latest"]
+        n = 0
+        end = time.monotonic() + seconds if seconds else None
+        while (end is None or time.monotonic() < end) and (count is None or n < count):
+            res = self.probe_events(since=since)
+            for ev in res["events"]:
+                on_event(ev)
+                n += 1
+                if count is not None and n >= count:
+                    break
+            since = res["next"]
+            time.sleep(poll)
+        return n
+
     def scratch(self, clear=False):
         return self.request("scratch", clear=clear)
 

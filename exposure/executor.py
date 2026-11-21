@@ -198,6 +198,7 @@ class ThreadExecutor:
         self._tk_root = None
         self._qt = None
         self.holding = False     # a pause is holding this thread
+        self.watchers = []       # callables run on this thread every iteration (break when)
         self._aloop = None
 
     # -- strategy -----------------------------------------------------------------
@@ -267,7 +268,7 @@ class ThreadExecutor:
 
     # -- enable / disable (lock held) ------------------------------------------------
     def _want(self):
-        return bool(self.queue) or self.sampling is not None
+        return bool(self.queue) or self.sampling is not None or bool(self.watchers)
 
     def _sync(self):
         if self.mode in ("tk", "qt", "asyncio"):
@@ -331,6 +332,11 @@ class ThreadExecutor:
 
     def _iteration(self):
         self.iterations += 1
+        for w in list(self.watchers):
+            try:
+                w()
+            except BaseException as exc:
+                self._note_error(exc)
         now = time.perf_counter()
         if self.sampling is not None:
             self.sampling.append(now)
@@ -431,6 +437,23 @@ class ThreadExecutor:
             elif self.mode == "asyncio":
                 self._aloop.call_soon_threadsafe(self._asyncio_run)
         return job
+
+    def add_watcher(self, fn):
+        """Run ``fn`` on this thread once per loop iteration (loop mode only)."""
+        with self.lock:
+            if self.mode is None:
+                self.mode = self._pick_mode()
+            if self.mode != "loop":
+                raise LookupError(f"per-frame checks need a Python main loop (this "
+                                  f"thread's executor is in {self.mode!r} mode)")
+            self.watchers.append(fn)
+            self._sync()
+
+    def remove_watcher(self, fn):
+        with self.lock:
+            if fn in self.watchers:
+                self.watchers.remove(fn)
+            self._sync()
 
     def sample(self, n, timeout):
         """Timestamps of ``n`` consecutive loop iterations (loop mode only)."""
@@ -628,6 +651,17 @@ class Pauser:
         if step_again:
             self._submit(not_before=ex.iterations + step_again)
         return "resumed"
+
+    def request(self):
+        """Ask for a pause without waiting (callable from any thread, including
+        this executor's own, e.g. from a breakpoint or a per-frame watcher)."""
+        with self.cond:
+            if self.active or self.want:
+                return False
+            self.want = True
+            self.deadline = None
+        self._submit()
+        return True
 
     def pause(self, seconds=None, timeout=10.0):
         with self.cond:

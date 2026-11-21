@@ -20,6 +20,7 @@ import json
 import os
 import shutil
 import sys
+import time
 
 from . import client as client_mod
 from . import config, exprs, paths, procs
@@ -168,6 +169,36 @@ def build_parser():
                        help="let print() output go to the program's own stdout")
         _run_opts(s)
     sub.add_parser("shell", parents=[parent], help="interactive session (REPL)")
+    # M6: logpoints, traces, breakpoints
+    s = sub.add_parser("log", parents=[parent], help="logpoint: print EXPR whenever FILE:LINE "
+                                                     "runs (no pause)")
+    s.add_argument("location", help="FILE:LINE, e.g. game.py:42 or ui/app.py:511")
+    s.add_argument("expr", help="Python expression evaluated in that frame")
+    s.add_argument("--when", help="only when this condition is true")
+    s.add_argument("--every", type=int, help="only every Nth hit")
+    s.add_argument("--rate", type=float, help="max lines per second (default 20)")
+    s.add_argument("--for", dest="seconds", type=float, help="remove itself after S seconds")
+    s.add_argument("--yes", "-y", action="store_true")
+    s.add_argument("--follow", "-f", action="store_true", help="then stream its output")
+    s = sub.add_parser("trace", parents=[parent], help="show every call of a function live")
+    s.add_argument("target", help="function or method path, e.g. self._mirror_param")
+    s.add_argument("--rate", type=float, help="max lines per second (default 20)")
+    s.add_argument("--for", dest="seconds", type=float)
+    s.add_argument("--follow", "-f", action="store_true", help="then stream its output")
+    s = sub.add_parser("break", parents=[parent], help="pause the main loop at FILE:LINE "
+                                                       "and/or when a condition is true")
+    s.add_argument("location", nargs="?", help="FILE:LINE (pauses at the next frame boundary)")
+    s.add_argument("--when", help="condition; alone, it's checked once per frame")
+    s.add_argument("--keep", action="store_true", help="stay armed after it fires")
+    s.add_argument("--yes", "-y", action="store_true")
+    s = sub.add_parser("logs", parents=[parent], help="stream logpoint/trace/break output")
+    s.add_argument("--for", dest="seconds", type=float, help="stop after S seconds")
+    s.add_argument("--count", type=int, help="stop after N lines")
+    s.add_argument("--all", action="store_true", help="include what's already buffered")
+    sub.add_parser("probes", parents=[parent], help="list logpoints, traces and breakpoints")
+    for name in ("unlog", "untrace", "unbreak", "unprobe"):
+        s = sub.add_parser(name, parents=[parent], help="remove a probe (or all)")
+        s.add_argument("probe", nargs="?", default="all")
     sub.add_parser("repeats", parents=[parent], help="list repeated calls")
     s = sub.add_parser("stop", parents=[parent], help="stop a repeated call (or all)")
     s.add_argument("repeat", nargs="?", default="all")
@@ -301,6 +332,30 @@ def print_src(res):
         print("  ... (truncated)")
 
 
+def print_probe(res):
+    what = res.get("spec") or res.get("when")
+    extra = f"  when {res['source']}" if res.get("kind") == "break" and res.get("source") \
+        else ""
+    _line(f"{res.get('kind')} {res['id']} added: {what}{extra}")
+    if res.get("note"):
+        _line(f"  {res['note']}")
+
+
+def print_event(ev):
+    stamp = time.strftime("%H:%M:%S", time.localtime(ev["t"])) + f".{int(ev['t'] * 1000) % 1000:03d}"
+    pid = f"#{ev['probe']}" if ev.get("probe") else "  "
+    _line(f"{stamp} {pid:>4} [{ev['thread']}] {ev['text']}")
+
+
+def _follow(c, since, seconds=None, count=None):
+    print("(streaming; Ctrl+C to stop)", file=sys.stderr)
+    try:
+        c.stream_events(print_event, since=since, seconds=seconds, count=count)
+    except KeyboardInterrupt:
+        pass
+    return 0
+
+
 def _confirm(question) -> bool:
     if not sys.stdin.isatty():
         print("exposure: eval/exec needs confirmation; pass --yes when not at a terminal",
@@ -385,6 +440,13 @@ def print_result(cmd, res):
         print_job(res)
     elif cmd == "doc":
         print_doc(res)
+    elif cmd == "probes":
+        if not res:
+            print("no probes")
+        _table([(p["id"], p["kind"], p.get("spec", ""), p.get("hits", ""), p.get("emitted", ""),
+                 p.get("suppressed", ""), "on" if p.get("enabled") else
+                 f"off: {p.get('disabled_reason')}") for p in res],
+               ["id", "kind", "where", "hits", "shown", "dropped", "state"], flex=2)
     elif cmd == "src":
         print_src(res)
     elif cmd == "find":
@@ -396,7 +458,8 @@ def print_result(cmd, res):
     elif cmd in ("pause", "resume", "step", "paused"):
         state = "PAUSED" if res.get("paused") else "running"
         extra = f", advanced {res['advanced']} frame(s)" if "advanced" in res else ""
-        print(f"{state} at iteration {res.get('iteration')}{extra}")
+        it = f" at iteration {res['iteration']}" if res.get("iteration") is not None else ""
+        print(f"{state}{it}{extra}")
         for k in ("auto_resume_in_s", "note", "warning"):
             if k in res:
                 print(f"  {k.replace('_', ' ')}: {res[k]}")
@@ -500,6 +563,39 @@ def main(argv=None) -> int:
                 from . import repl
                 repl.run(c)
                 return 0
+            elif args.cmd == "log":
+                if not args.yes and cfg["client"]["confirm"]:
+                    if not _confirm(f"logpoint in pid {c.pid} evaluating {args.expr!r}"):
+                        print("not added", file=sys.stderr)
+                        return 1
+                res = c.log(args.location, args.expr, when=args.when, every=args.every,
+                            rate=args.rate, seconds=args.seconds, confirmed=True)
+                print_probe(res)
+                if args.follow:
+                    return _follow(c, None)
+                return 0
+            elif args.cmd == "trace":
+                res = c.trace(args.target, rate=args.rate, seconds=args.seconds)
+                print_probe(res)
+                if args.follow:
+                    return _follow(c, None)
+                return 0
+            elif args.cmd == "break":
+                needs = bool(args.when)
+                if needs and not args.yes and cfg["client"]["confirm"]:
+                    if not _confirm(f"breakpoint condition in pid {c.pid}: {args.when!r}"):
+                        print("not added", file=sys.stderr)
+                        return 1
+                res = c.break_(args.location, when=args.when, keep=args.keep or None,
+                               confirmed=needs)
+                print_probe(res)
+                return 0
+            elif args.cmd == "logs":
+                return _follow(c, 0 if args.all else None, args.seconds, args.count)
+            elif args.cmd == "probes":
+                res = c.probes()
+            elif args.cmd in ("unlog", "untrace", "unbreak", "unprobe"):
+                res = c.unprobe(args.probe)
             elif args.cmd == "set":
                 if args.value is None:
                     res = c.assign(args.target, on=args.on, timeout=args.timeout)
