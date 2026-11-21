@@ -302,6 +302,12 @@ class Agent:
         self.stop.set()
         self._remove_files()
         try:
+            # On Linux, close() alone doesn't wake an accept() blocked in another
+            # thread (it waits out the 0.5 s timeout); shutdown() does.
+            self.sock.shutdown(socket.SHUT_RDWR)
+        except BaseException:
+            pass
+        try:
             self.sock.close()
         except BaseException:
             pass

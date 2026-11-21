@@ -96,6 +96,7 @@ the cycle count (default 1000).
 | Test | Result |
 |---|---|
 | **1000 attach/detach cycles** on one target, a main-loop call every 10th cycle | **50.6 s (50.6 ms per cycle)**. Afterwards: one agent thread, no stray connection or call threads, all six `sys.monitoring` tool ids free, `sys.stdout`/`stderr` the original `TextIOWrapper`s again, no leftover session or boot files. Target handle count went from 108 to 110. |
+| **1000 attach/detach cycles on Linux** (the coordinator's cloud run) | First 505 s (505 ms per cycle): closing the listening socket didn't wake the `accept()` blocked in the agent thread on Linux, so every detach waited out the 0.5 s accept timeout. With `shutdown()` before `close()`: **13.2 s on 3.14 (13.2 ms per cycle, handles 4 to 5), 14.3 s on 3.14t**, and the default suite dropped from 42.6 s to 35.5 s. Windows is unchanged (53.0 s, handles 108 to 109). |
 | **Thread churn**: a target starting and joining 8 threads at a time, non-stop | 33 attach / browse (threads, stack, ls, `find type:Thread`) / detach cycles in 20 s, with no errors and the target alive |
 
 The first 1000-cycle runs found two real bugs, both fixed:
