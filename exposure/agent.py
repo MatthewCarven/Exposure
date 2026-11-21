@@ -30,6 +30,7 @@ import traceback
 import types
 
 import ast
+import collections
 
 from . import executor as executor_mod
 from . import inspector, paths, policy as policy_mod, protocol
@@ -224,6 +225,9 @@ class Agent:
         self._conn_seq = 0
         self._open_conns = 0
         self._conns = set()
+        self.pauser = None
+        self.repeats = {}
+        self._repeat_ids = 0
         self.policy = None
         self.policy_error = None
         self._load_policy()
@@ -272,6 +276,13 @@ class Agent:
         if self._cleaned:
             return
         self._cleaned = True
+        for r in list(self.repeats.values()):   # stop repeated calls
+            r["stop"].set()
+        if self.pauser is not None:              # never leave the program frozen
+            try:
+                self.pauser.resume(timeout=2.0)
+            except BaseException:
+                pass
         for ex in list(self.executors.values()):
             try:
                 ex.close()
@@ -1035,6 +1046,13 @@ class Agent:
         return parent, perm, last, member
 
     def cmd_call(self, target, args=None, kwargs=None, on=None, timeout=10.0):
+        fn = self._prepare_call(target, args, kwargs)
+        job = self._run(fn, f"call {target}", self._executor(on), timeout)
+        result_perm = dict(READ_ONLY) if self.scope == "explicit" else None
+        return self._job_report(job, result_perm)
+
+    def _prepare_call(self, target, args=None, kwargs=None):
+        """Check permissions, resolve arguments, return a no-arg callable."""
         self._check_writable()
         parent, perm, seg, member = self._resolve_callee(target)
         if parent is None:
@@ -1060,10 +1078,7 @@ class Agent:
         else:
             def fn(parent=parent, key=seg[1]):
                 return parent[key](*a, **kw)
-
-        job = self._run(fn, f"call {target}", self._executor(on), timeout)
-        result_perm = dict(READ_ONLY) if self.scope == "explicit" else None
-        return self._job_report(job, result_perm)
+        return fn
 
     def cmd_do(self, action, args=None, kwargs=None, on=None, timeout=10.0):
         """Run a named action from the policy's [actions] table."""
@@ -1171,28 +1186,53 @@ class Agent:
             raise ValueError(kind)
         return old, existed
 
-    def cmd_set(self, target, value, on=None, timeout=10.0):
+    def cmd_set(self, target, value=None, on=None, timeout=10.0, delta=None):
         self._check_writable()
         kind, container, key, _perm, frame = self._plan_set(target)
-        new = self._value(value)
+        if delta is None:
+            new = self._value(value)
+        elif isinstance(delta, bool) or not isinstance(delta, (int, float)):
+            raise TypeError("delta must be a number")
         sys.audit("exposure.set", target)
         ex = self._frame_executor(frame) if frame is not None else self._executor(on)
         self._change_ids += 1
         cid = self._change_ids
 
         def fn():
-            old, existed = self._apply(kind, container, key, new)
-            return _SetResult(old, existed, new, cid)
+            value = new if delta is None else self._nudged(kind, container, key, delta)
+            old, existed = self._apply(kind, container, key, value)
+            return _SetResult(old, existed, value, cid)
 
-        job = self._run(fn, f"set {target}", ex, timeout)
+        label = f"set {target}" if delta is None else f"nudge {target} {delta:+g}"
+        job = self._run(fn, label, ex, timeout)
         if job.done.is_set() and job.ok:
             r = job.result
             self.changes.append({"id": cid, "target": target, "kind": kind,
                                  "container": container, "key": key, "old": r.old,
-                                 "existed": r.existed, "new": new, "frame": frame,
+                                 "existed": r.existed, "new": r.new, "frame": frame,
                                  "on": on, "time": time.time(), "undone": False})
             del self.changes[:-500]
         return self._job_report(job)
+
+    def cmd_nudge(self, target, delta, on=None, timeout=10.0):
+        """Add ``delta`` to a number, read and written on the executing thread."""
+        return self.cmd_set(target, on=on, timeout=timeout, delta=delta)
+
+    @staticmethod
+    def _nudged(kind, container, key, delta):
+        if kind == "attr":
+            cur = getattr(container, key)
+        elif kind == "local":
+            cur = container.f_locals[key]
+        elif kind == "cell":
+            cur = container.cell_contents
+        else:
+            cur = container[key]
+        if isinstance(cur, bool) or not isinstance(cur, (int, float)):
+            raise TypeError(f"can only nudge numbers, not {type(cur).__name__}")
+        if isinstance(cur, int) and isinstance(delta, float) and not delta.is_integer():
+            return cur + delta
+        return type(cur)(cur + delta)
 
     def cmd_undo(self, n=1, timeout=10.0):
         self._check_writable()
@@ -1268,6 +1308,224 @@ class Agent:
         return {"completed": ok, "frames": len(diffs), "mean_ms": round(mean * 1000, 3),
                 "median_ms": pct(50), "p95_ms": pct(95), "p99_ms": pct(99),
                 "max_ms": round(diffs[-1] * 1000, 3), "fps": round(1 / mean, 2) if mean else None}
+
+
+    # =====================================================================================
+    # M3: game tools
+    # =====================================================================================
+
+    PAUSE_WARNING = ("the main loop is frozen: a GUI stops repainting and Windows marks it "
+                     "'Not Responding' after ~5 s; other threads (an audio callback, workers) "
+                     "keep running. Calls and sets still work while paused.")
+
+    def _pauser(self):
+        if self.pauser is None:
+            self.pauser = executor_mod.Pauser(self._main_executor())
+        return self.pauser
+
+    def cmd_pause(self, seconds=None, timeout=10.0):
+        self._check_writable()
+        p = self._pauser()
+        ok = p.pause(seconds, float(timeout))
+        out = p.status()
+        if not ok:
+            out["note"] = ("pause queued but the main thread hasn't reached it yet "
+                           "(it isn't running Python); it will pause when it does")
+        out["warning"] = self.PAUSE_WARNING
+        return out
+
+    def cmd_resume(self):
+        p = self._pauser()
+        p.resume()
+        return p.status()
+
+    def cmd_step(self, n=1, timeout=10.0):
+        self._check_writable()
+        p = self._pauser()
+        before = p.ex.iterations
+        ok = p.step(int(n), float(timeout))
+        out = p.status()
+        out["advanced"] = p.ex.iterations - before
+        if not ok:
+            out["note"] = "the loop hasn't come round again yet"
+        return out
+
+    def cmd_paused(self):
+        return self._pauser().status() if self.pauser else {"paused": False}
+
+    # -- watch --------------------------------------------------------------------------
+    def cmd_sample(self, paths_):
+        """Read several paths at once (``watch``). ``len(path)`` gives a
+        built-in container's length. Read-only, on the agent thread."""
+        out = []
+        for text in paths_:
+            self.budget.tick()
+            row = {"path": text}
+            try:
+                target = text.strip()
+                want_len = target.startswith("len(") and target.endswith(")")
+                if want_len:
+                    target = target[4:-1]
+                obj, _perm = self._resolve(target)
+                if want_len:
+                    kind, items = inspector.container_items(obj, self.budget.tick)
+                    if kind is None:
+                        raise TypeError(f"len() only for built-in containers, not "
+                                        f"{inspector.type_name(obj)}")
+                    row.update(type="int", preview=str(len(items)))
+                else:
+                    row.update(type=inspector.type_name(obj) if not isinstance(
+                        obj, inspector.NotEvaluated) else "property",
+                        preview=inspector.preview(obj))
+            except Exception as exc:
+                row["error"] = f"{type(exc).__name__}: {exc}"
+            out.append(row)
+        return {"t": time.time(), "values": out}
+
+    # -- find ------------------------------------------------------------------------------
+    def cmd_find(self, query, via="graph", limit=50, depth=6, max_nodes=200000):
+        """``type:Name`` (class name, qualname or module.qualname, matching
+        subclasses too) or ``name:pattern`` (fnmatch on attribute/key names).
+
+        via="graph" walks the reachable scope breadth-first in budgeted slices
+        (safe beside an audio callback). via="gc" scans gc.get_objects(), which
+        sees everything but builds its list in one long C call.
+        """
+        import fnmatch
+        import gc
+        kind, _, pat = str(query).partition(":")
+        if kind not in ("type", "name") or not pat:
+            raise ValueError("query must be type:ClassName or name:pattern")
+        limit = max(1, min(int(limit), MAX_LIMIT))
+
+        def type_matches(obj):
+            for c in type(obj).__mro__:
+                if pat in (c.__name__, c.__qualname__, f"{c.__module__}.{c.__qualname__}"):
+                    return True
+            return False
+
+        results, seen_ids, scanned = [], set(), 0
+        t0 = time.perf_counter()
+        if via == "gc":
+            if self.scope == "explicit":
+                raise PermissionError("explicit scope: find --via gc would look outside it")
+            if kind != "type":
+                raise ValueError("--via gc finds types only; use the default graph walk for "
+                                 "name: queries")
+            objs = gc.get_objects()
+            gc_ms = round((time.perf_counter() - t0) * 1000, 3)
+            for obj in objs:
+                scanned += 1
+                if scanned % 256 == 0:
+                    self.budget.tick()
+                if type_matches(obj):
+                    results.append(self._entry(inspector.type_name(obj), None, "instance", obj))
+                    if len(results) >= limit:
+                        break
+            del objs
+            return {"query": query, "via": "gc", "scanned": scanned, "results": results,
+                    "truncated": len(results) >= limit, "gc_get_objects_ms": gc_ms,
+                    "ms": round((time.perf_counter() - t0) * 1000, 3)}
+        # breadth-first over the reachable (or explicit) scope
+        explicit = self._explicit_items()
+        queue = collections.deque()
+        roots = self._ls_roots(explicit, MAX_LIMIT, 0)
+        for e in roots["entries"]:
+            if "path" in e and e.get("type") != "unresolved":
+                try:
+                    obj, _ = self._resolve(e["path"])
+                except Exception:
+                    continue
+                queue.append((e["path"], obj, 0))
+        while queue and len(results) < limit and scanned < max_nodes:
+            path, obj, d = queue.popleft()
+            if id(obj) in seen_ids:
+                continue
+            seen_ids.add(id(obj))
+            scanned += 1
+            self.budget.tick()
+            if kind == "type" and type_matches(obj):
+                results.append(self._entry(path.rsplit(".", 1)[-1], path, "instance", obj))
+            if d >= depth or isinstance(obj, (types.ModuleType, type, types.FunctionType,
+                                               types.FrameType)) and d > 0:
+                continue   # don't wander into libraries, classes or other frames
+            try:
+                kids = inspector.children(obj, self.budget.tick)
+            except Exception:
+                continue
+            for label, seg, ckind, value in kids:
+                if isinstance(value, inspector.NotEvaluated):
+                    continue
+                cpath = path + paths.format_segments([seg]) if seg is not None else None
+                if kind == "name" and fnmatch.fnmatch(str(label).strip("'\""), pat):
+                    results.append(self._entry(label, cpath, ckind, value))
+                    if len(results) >= limit:
+                        break
+                if cpath is not None and not isinstance(value, inspector.SCALARS + inspector.TEXT):
+                    queue.append((cpath, value, d + 1))
+        return {"query": query, "via": "graph", "scanned": scanned, "results": results,
+                "truncated": len(results) >= limit or scanned >= max_nodes,
+                "ms": round((time.perf_counter() - t0) * 1000, 3)}
+
+    # -- repeated calls ---------------------------------------------------------------------
+    def cmd_every(self, target, interval, args=None, kwargs=None, count=None, on=None):
+        fn = self._prepare_call(target, args, kwargs)
+        interval = max(0.01, float(interval))
+        ex = self._executor(on)
+        self._repeat_ids += 1
+        rid = self._repeat_ids
+        stop = threading.Event()
+        rec = {"id": rid, "target": target, "interval": interval, "on": on or "main",
+               "count": count, "runs": 0, "errors": 0, "last": None, "stop": stop,
+               "started": time.time()}
+
+        def loop():
+            try:
+                while not stop.is_set() and not self.stop.is_set():
+                    job = executor_mod.Job(fn, f"every {target}", getattr(ex, "mode", "agent"))
+                    self.jobs.add(job)
+                    ex.submit(job)
+                    job.done.wait(max(10.0, interval * 4))
+                    rec["runs"] += 1
+                    if job.done.is_set() and not job.ok:
+                        rec["errors"] += 1
+                    rec["last"] = job.id
+                    if count and rec["runs"] >= int(count):
+                        break
+                    stop.wait(interval)
+            except BaseException:
+                pass
+            finally:
+                rec["finished"] = time.time()
+
+        rec["thread"] = threading.Thread(target=loop, name=f"exposure-every-{rid}", daemon=True)
+        self.repeats[rid] = rec
+        rec["thread"].start()
+        return self._repeat_info(rec)
+
+    @staticmethod
+    def _repeat_info(rec):
+        return {k: rec.get(k) for k in ("id", "target", "interval", "on", "count", "runs",
+                                        "errors", "last")} | {
+            "running": "finished" not in rec}
+
+    def cmd_repeats(self):
+        return [self._repeat_info(r) for r in self.repeats.values()]
+
+    def cmd_stop(self, repeat=None):
+        recs = list(self.repeats.values()) if repeat in (None, "all") else [
+            self.repeats.get(int(repeat))]
+        stopped = []
+        for r in recs:
+            if r is None:
+                raise LookupError(f"no repeat {repeat}")
+            r["stop"].set()
+            stopped.append(r["id"])
+        return {"stopped": stopped}
+
+    # -- presets ------------------------------------------------------------------------------
+    def cmd_presets(self):
+        return self.policy.presets if self.policy else {}
 
 
 class _SetResult:

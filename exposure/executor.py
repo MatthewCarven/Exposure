@@ -39,7 +39,7 @@ MAX_JOBS = 200
 
 class Job:
     __slots__ = ("id", "fn", "label", "where", "created", "started", "finished",
-                 "ok", "result", "exc", "tb", "blocked_ms", "thread", "done")
+                 "ok", "result", "exc", "tb", "blocked_ms", "thread", "done", "not_before")
 
     def __init__(self, fn, label, where):
         self.id = next(_job_ids)
@@ -56,6 +56,7 @@ class Job:
         self.blocked_ms = None
         self.thread = None
         self.done = threading.Event()
+        self.not_before = 0      # earliest executor iteration this may run on
 
     def run(self):
         self.started = time.time()
@@ -148,6 +149,7 @@ class ThreadExecutor:
         self.errors = []
         self._tk_root = None
         self._qt = None
+        self.holding = False     # a pause is holding this thread
 
     # -- strategy -----------------------------------------------------------------
     def _top_frame(self):
@@ -294,6 +296,9 @@ class ThreadExecutor:
                 if not self.queue:
                     return
                 job = self.queue.popleft()
+                if job.not_before and self.iterations < job.not_before:
+                    self.queue.appendleft(job)   # e.g. a re-pause after `step N`
+                    return
             job.run()
             if time.perf_counter() - start >= self.budget_s:
                 return  # the rest waits for the next iteration
@@ -305,11 +310,12 @@ class ThreadExecutor:
 
     def _tk_run(self):
         try:
+            self.iterations += 1
             self._drain()
             with self.lock:
                 more = bool(self.queue)
             if more:
-                self._tk_root.after(1, self._tk_run)
+                self._tk_root.after(16, self._tk_run)
         except BaseException as exc:
             self._note_error(exc)
 
@@ -320,6 +326,7 @@ class ThreadExecutor:
 
     def _qt_run(self):
         try:
+            self.iterations += 1
             self._drain()
             with self.lock:
                 more = bool(self.queue)
@@ -335,10 +342,15 @@ class ThreadExecutor:
                 self.mode = self._pick_mode()
             self.queue.append(job)
             self._sync()
-        if self.mode == "tk":
-            self._tk_kick()
-        elif self.mode == "qt":
-            self._qt_kick()
+            holding = self.holding
+        # While a pause holds the GUI thread inside one of our callbacks, a
+        # Tk kick from this thread would block forever waiting for Tcl to
+        # service it; the hold loop drains the queue itself instead.
+        if not holding:
+            if self.mode == "tk":
+                self._tk_kick()
+            elif self.mode == "qt":
+                self._qt_kick()
         return job
 
     def sample(self, n, timeout):
@@ -472,3 +484,105 @@ class Jobs:
 
     def pending(self):
         return [j for j in self.all() if not j.done.is_set()]
+
+
+class Pauser:
+    """Freezes an executor's thread between iterations (``pause``/``step``).
+
+    The pause is itself a queued job: when it runs (at the loop's back-edge,
+    in a Tk/Qt callback, or at the next line) it holds the thread on a
+    condition variable. Other queued jobs still run while paused, so calls
+    and sets work on the frozen frame. ``step N`` releases the hold and
+    queues a new pause that may not run until N more iterations have passed.
+    Other threads, including an audio callback, keep running.
+    """
+
+    def __init__(self, ex):
+        self.ex = ex
+        self.cond = threading.Condition()
+        self.want = False
+        self.active = False
+        self.steps_pending = 0
+        self.deadline = None
+        self.paused_at = None
+        self.paused_iteration = None
+        self.holds = 0
+        self.total_paused_s = 0.0
+
+    def _submit(self, not_before=0):
+        job = Job(self._hold, "pause", self.ex.mode or "main")
+        job.not_before = not_before
+        self.ex.submit(job)
+        return job
+
+    def _hold(self):
+        ex = self.ex
+        with self.cond:
+            if not self.want:
+                return "not paused"
+            self.active = True
+            self.holds += 1
+            self.paused_at = time.monotonic()
+            self.paused_iteration = ex.iterations
+            ex.holding = True
+            self.cond.notify_all()
+        step_again = 0
+        try:
+            while True:
+                with self.cond:
+                    if self.deadline is not None and time.monotonic() >= self.deadline:
+                        self.want = False
+                    if not self.want:
+                        break
+                    if self.steps_pending:
+                        step_again, self.steps_pending = self.steps_pending, 0
+                        break
+                    self.cond.wait(0.02)
+                ex._drain()   # calls and sets queued while paused still run
+        finally:
+            with self.cond:
+                self.active = False
+                ex.holding = False
+                self.total_paused_s += time.monotonic() - self.paused_at
+                self.cond.notify_all()
+        if step_again:
+            self._submit(not_before=ex.iterations + step_again)
+        return "resumed"
+
+    def pause(self, seconds=None, timeout=10.0):
+        with self.cond:
+            self.want = True
+            self.deadline = time.monotonic() + float(seconds) if seconds else None
+            if self.active:
+                return True
+        self._submit()
+        with self.cond:
+            return self.cond.wait_for(lambda: self.active, timeout)
+
+    def resume(self, timeout=5.0):
+        with self.cond:
+            self.want = False
+            self.steps_pending = 0
+            self.cond.notify_all()
+            return self.cond.wait_for(lambda: not self.active, timeout)
+
+    def step(self, n=1, timeout=10.0):
+        with self.cond:
+            if not self.active:
+                raise LookupError("not paused (use `pause` first)")
+            before = self.holds
+            self.steps_pending = max(1, int(n))
+            self.cond.notify_all()
+            return self.cond.wait_for(lambda: self.active and self.holds > before, timeout)
+
+    def status(self):
+        with self.cond:
+            out = {"paused": self.active, "requested": self.want,
+                   "iteration": self.ex.iterations,
+                   "total_paused_s": round(self.total_paused_s, 3)}
+            if self.active:
+                out["paused_for_s"] = round(time.monotonic() - self.paused_at, 3)
+                out["paused_at_iteration"] = self.paused_iteration
+            if self.deadline is not None and self.want:
+                out["auto_resume_in_s"] = round(max(0.0, self.deadline - time.monotonic()), 3)
+            return out

@@ -55,6 +55,7 @@ class Policy:
     rules: list[Rule] = field(default_factory=list)
     agent: dict = field(default_factory=dict)
     actions: dict = field(default_factory=dict)   # name -> {"call": path, "on": ...}
+    presets: dict = field(default_factory=dict)   # name -> {"watch": [...], "tweak": [...]}
 
 
 def _perm(value, key, what):
@@ -121,9 +122,36 @@ def parse(data: dict, path: str | None = None) -> Policy:
         except paths.PathError as exc:
             raise PolicyError(f"[actions] {name}: {exc}") from None
         actions[name] = {"call": spec["call"], "on": on}
+    presets = {}
+    raw_presets = data.get("presets", {}) or {}
+    if not isinstance(raw_presets, dict):
+        raise PolicyError("[presets] must be a table of [presets.NAME] tables")
+    for name, spec in raw_presets.items():
+        if not isinstance(spec, dict):
+            raise PolicyError(f"[presets.{name}] must be a table")
+        unknown = set(spec) - {"watch", "tweak", "rate", "step"}
+        if unknown:
+            raise PolicyError(f"[presets.{name}]: unknown key(s) {sorted(unknown)}")
+        preset = {}
+        for key in ("watch", "tweak"):
+            items = spec.get(key, [])
+            if not isinstance(items, list) or not all(isinstance(x, str) for x in items):
+                raise PolicyError(f"[presets.{name}] {key} must be a list of paths")
+            preset[key] = list(items)
+        if "rate" in spec:
+            if not isinstance(spec["rate"], (int, float)) or spec["rate"] <= 0:
+                raise PolicyError(f"[presets.{name}] rate must be a positive number (Hz)")
+            preset["rate"] = float(spec["rate"])
+        if "step" in spec:
+            steps = spec["step"]
+            if not isinstance(steps, dict) or not all(
+                    isinstance(v, (int, float)) for v in steps.values()):
+                raise PolicyError(f"[presets.{name}] step must map paths to numbers")
+            preset["step"] = dict(steps)
+        presets[name] = preset
     return Policy(path=path, scope=scope, entry=agent.get("entry"),
                   pressure=agent.get("pressure"), rules=rules, agent=dict(agent),
-                  actions=actions)
+                  actions=actions, presets=presets)
 
 
 def load(path: str) -> Policy:

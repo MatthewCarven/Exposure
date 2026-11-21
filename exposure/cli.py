@@ -107,6 +107,46 @@ def build_parser():
     sub.add_parser("executors", parents=[parent], help="how work reaches each thread")
     s = sub.add_parser("frames", parents=[parent], help="main-loop iteration time stats")
     s.add_argument("n", nargs="?", type=int, default=300)
+    # M3
+    s = sub.add_parser("pause", parents=[parent], help="freeze the main loop between frames")
+    s.add_argument("--for", dest="seconds", type=float, help="resume by itself after S seconds")
+    sub.add_parser("resume", parents=[parent], help="let the main loop run again")
+    s = sub.add_parser("step", parents=[parent], help="while paused, advance N frames")
+    s.add_argument("n", nargs="?", type=int, default=1)
+    sub.add_parser("paused", parents=[parent], help="pause status")
+    for name, hlp in (("watch", "live panel of values"), ("tweak", "nudge numbers live")):
+        s = sub.add_parser(name, parents=[parent], help=hlp)
+        s.add_argument("paths", nargs="*", help="paths; len(path) for a container's length")
+        s.add_argument("--rate", type=float, help="refreshes per second (default 10)")
+        s.add_argument("--count", type=int, help="stop after N refreshes (scripts, tests)")
+        s.add_argument("--plain", action="store_true", help="no colours or redraw")
+        s.add_argument("--preset", help="take paths from [presets.NAME] in exposure.toml")
+        if name == "tweak":
+            s.add_argument("--step", type=float, default=1.0, help="nudge size (default 1)")
+            s.add_argument("--watch", nargs="*", default=[], help="also show these paths")
+    s = sub.add_parser("preset", parents=[parent], help="open a [presets.NAME] panel")
+    s.add_argument("name")
+    s.add_argument("--count", type=int)
+    s.add_argument("--plain", action="store_true")
+    sub.add_parser("presets", parents=[parent], help="list presets from exposure.toml")
+    s = sub.add_parser("nudge", parents=[parent], help="add DELTA to a number (undoable)")
+    s.add_argument("target")
+    s.add_argument("delta", type=float)
+    _run_opts(s)
+    s = sub.add_parser("find", parents=[parent], help="find objects: type:Name or name:pattern")
+    s.add_argument("query")
+    s.add_argument("--via", choices=["graph", "gc"], help="graph (default: walk the reachable "
+                   "scope, budgeted) or gc (whole heap, one long C call)")
+    s.add_argument("--limit", type=int)
+    s.add_argument("--depth", type=int)
+    s = sub.add_parser("every", parents=[parent], help="call something repeatedly")
+    s.add_argument("interval", help="e.g. 1s, 250ms, 0.5")
+    s.add_argument("expr")
+    s.add_argument("--count", type=int, help="stop after N calls")
+    s.add_argument("--on")
+    sub.add_parser("repeats", parents=[parent], help="list repeated calls")
+    s = sub.add_parser("stop", parents=[parent], help="stop a repeated call (or all)")
+    s.add_argument("repeat", nargs="?", default="all")
     return ap
 
 
@@ -157,6 +197,35 @@ def print_ls(res):
         print(f"... {res['total'] - nxt} more (use --offset {nxt})")
 
 
+def _panel(c, args):
+    from . import tui
+    watch, tweak, steps, rate = list(getattr(args, "paths", []) or []), [], {}, None
+    preset_name = args.name if args.cmd == "preset" else getattr(args, "preset", None)
+    if preset_name:
+        presets = c.presets()
+        if preset_name not in presets:
+            print(f"exposure: no preset {preset_name!r} (have: {sorted(presets)})",
+                  file=sys.stderr)
+            return 2
+        p = presets[preset_name]
+        watch += p.get("watch", [])
+        tweak += p.get("tweak", [])
+        steps.update(p.get("step", {}))
+        rate = p.get("rate")
+    if args.cmd == "tweak":
+        tweak = list(args.paths) + tweak
+        watch = list(args.watch) + [w for w in watch if w not in args.paths]
+        for t in args.paths:
+            steps.setdefault(t, args.step)
+    if not watch and not tweak:
+        print("exposure: nothing to show (give paths or --preset)", file=sys.stderr)
+        return 2
+    rate = getattr(args, "rate", None) or rate or 10.0
+    tui.run_panel(c, watch, tweak, rate=rate, steps=steps, count=args.count,
+                  plain=args.plain)
+    return 0
+
+
 def print_job(res):
     head = f"job {res['job']} {res['state']}"
     if res.get("thread"):
@@ -189,8 +258,25 @@ def print_result(cmd, res):
     elif cmd == "ps":
         _table([(p.pid, p.version or "?", p.attachable, p.name, p.exe or p.cmdline or "")
                 for p in res], ["pid", "python", "attachable", "name", "exe"])
-    elif cmd in ("call", "set", "do", "result"):
+    elif cmd in ("call", "set", "do", "result", "nudge"):
         print_job(res)
+    elif cmd == "find":
+        print(f"{res['query']} via {res['via']}: {len(res['results'])} found, "
+              f"{res['scanned']} objects scanned in {res['ms']} ms"
+              + (" (truncated)" if res["truncated"] else ""))
+        _table([(e.get("handle", ""), e.get("path") or e["name"], e["preview"])
+                for e in res["results"]], ["handle", "where", "value"])
+    elif cmd in ("pause", "resume", "step", "paused"):
+        state = "PAUSED" if res.get("paused") else "running"
+        extra = f", advanced {res['advanced']} frame(s)" if "advanced" in res else ""
+        print(f"{state} at iteration {res.get('iteration')}{extra}")
+        for k in ("auto_resume_in_s", "note", "warning"):
+            if k in res:
+                print(f"  {k.replace('_', ' ')}: {res[k]}")
+    elif cmd == "repeats":
+        _table([(r["id"], "running" if r["running"] else "stopped", r["interval"], r["runs"],
+                 r["errors"], r["target"]) for r in res],
+               ["id", "state", "every s", "runs", "errors", "call"])
     elif cmd == "history":
         _table([(h["change"], h["target"], h["old"], h["new"], "undone" if h["undone"] else "")
                 for h in res], ["change", "target", "old", "new", ""])
@@ -284,6 +370,29 @@ def main(argv=None) -> int:
                 res = c.executors()
             elif args.cmd == "frames":
                 res = c.frames(args.n)
+            elif args.cmd == "pause":
+                res = c.pause(args.seconds)
+            elif args.cmd == "resume":
+                res = c.resume()
+            elif args.cmd == "step":
+                res = c.step(args.n)
+            elif args.cmd == "paused":
+                res = c.paused()
+            elif args.cmd in ("watch", "tweak", "preset"):
+                return _panel(c, args)
+            elif args.cmd == "presets":
+                res = c.presets()
+            elif args.cmd == "nudge":
+                d = int(args.delta) if args.delta.is_integer() else args.delta
+                res = c.nudge(args.target, d, on=args.on, timeout=args.timeout)
+            elif args.cmd == "find":
+                res = c.find(args.query, via=args.via, limit=args.limit, depth=args.depth)
+            elif args.cmd == "every":
+                res = c.every(args.interval, args.expr, count=args.count, on=args.on)
+            elif args.cmd == "repeats":
+                res = c.repeats()
+            elif args.cmd == "stop":
+                res = c.stop(args.repeat)
             else:  # pragma: no cover
                 raise SystemExit(f"unknown command {args.cmd}")
         if args.json:

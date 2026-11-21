@@ -337,6 +337,44 @@ class Client:
     def frames(self, n=300, timeout=None):
         return self.request("frames", n=n, timeout=timeout)
 
+    # -- M3: game tools -------------------------------------------------------------------
+    def pause(self, seconds=None, timeout=None):
+        return self.request("pause", seconds=seconds, timeout=timeout)
+
+    def resume(self):
+        return self.request("resume")
+
+    def step(self, n=1, timeout=None):
+        return self.request("step", n=n, timeout=timeout)
+
+    def paused(self):
+        return self.request("paused")
+
+    def sample(self, paths):
+        return self.request("sample", paths_=list(paths))
+
+    def nudge(self, target, delta, *, on=None, timeout=None):
+        return self.request("nudge", target=exprs.parse_target(target), delta=delta, on=on,
+                            timeout=timeout)
+
+    def find(self, query, *, via=None, limit=None, depth=None):
+        return self.request("find", query=query, via=via, limit=limit, depth=depth)
+
+    def every(self, interval, expr, *, count=None, on=None):
+        target, args, kwargs = exprs.parse_call(expr)
+        return self.request("every", target=target, interval=parse_interval(interval),
+                            args=args, kwargs=kwargs, count=count, on=on)
+
+    def repeats(self):
+        return self.request("repeats")
+
+    def stop(self, repeat=None):
+        return self.request("stop", repeat=repeat)
+
+    def presets(self):
+        return self.request("presets")
+
+
     def detach(self):
         try:
             return self.request("detach")
@@ -354,3 +392,14 @@ class Client:
 
     def __exit__(self, *exc):
         self.close()
+
+
+def parse_interval(text) -> float:
+    """'1s', '250ms', '0.5', 2 -> seconds."""
+    if isinstance(text, (int, float)):
+        return float(text)
+    t = str(text).strip().lower()
+    for suffix, scale in (("ms", 0.001), ("s", 1.0), ("m", 60.0)):
+        if t.endswith(suffix):
+            return float(t[:-len(suffix)]) * scale
+    return float(t)
