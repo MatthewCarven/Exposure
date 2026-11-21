@@ -65,6 +65,9 @@ def test_shell_polish(make_target):
 @needs_314
 def test_dropped_client_is_tidied_quickly(make_target):
     t = make_target(script="game_loop.py")
+    # inject from here (the target's parent): on Linux, ptrace_scope=1 stops a
+    # sibling process from injecting; the helper below then reuses the session
+    Client.attach(t.pid, drop_grace=1).close()
     # a client that is killed (no bye) -> the agent tidies up after the grace
     code = (f"import sys, time; sys.path.insert(0, {ROOT!r}); "
             "from exposure.client import Client; "
