@@ -391,6 +391,28 @@ Done. Full write-up in `docs/M4-results.md`.
 - **PySynthRack with audio on**: 200 captured evals on the main loop caused 0
   xruns and left the frame time unchanged.
 
+### M5 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M5-results.md`.
+- **`exposure.serve(policy=...)` strict mode**: works with remote debugging
+  disabled; the policy is fixed at startup, eval/exec are off, and detach ends
+  the session but the agent keeps serving.
+- **Audit**: an optional JSON-lines audit log, plus new `exposure.attach` and
+  `exposure.detach` `sys.audit` events. A raising audit hook blocks cleanly.
+- **Free-threaded 3.14t**: the full suite passes, and a state lock covers the
+  races the GIL used to hide. CPython refuses injection across builds, so
+  Exposure detects that and explains the way round it (a 3.14t client
+  injects, then any client connects).
+- **Stress**: 1000 attach/detach cycles in 50.6 s with no leaks of threads,
+  monitoring tool ids, streams, files or handles. Thread-churn and
+  several-client tests also pass. Two detach races were found this way and
+  fixed.
+- **Packaging** as `exposure-debugger` (import `exposure`), built and checked,
+  with a clean install tested; not published (GitHub install only, Matthew's
+  choice).
+- **CI**: GitHub Actions on windows-latest and ubuntu-24.04, with 3.14 and
+  3.14t.
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.
@@ -410,4 +432,4 @@ All answered (Matthew accepted every recommendation, 21 Nov 2026).
 3. ~~Which platforms matter first?~~ **Answered:** Windows first, Linux right behind (both tested from M1 on), macOS later.
 4. ~~What kind of programs?~~ **Answered:** GUI apps and games. Now in §4.5, and main-loop execution moved up to M2. First target is PySynthRack (DearPyGui + sounddevice), now in §4.6. **Answered:** yes to a separate Python 3.14 venv (`.venv314`) for PySynthRack, MIDI input optional until python-rtmidi ships a 3.14 wheel.
 5. ~~CLI style?~~ **Answered:** both one-shot commands (shipping now) and an interactive REPL (M4).
-6. ~~Is the name final, and PyPI?~~ **Answered:** keep the name Exposure. `exposure` is already taken on PyPI, so if it's ever published, use a distribution name such as `exposure-debugger` (free as of 21 Nov 2026), with the import name still `exposure`. Decide on publishing at M5.
+6. ~~Is the name final, and PyPI?~~ **Answered:** keep the name Exposure. `exposure` is already taken on PyPI, so if it's ever published, use a distribution name such as `exposure-debugger` (free as of 21 Nov 2026), with the import name still `exposure`. Decided at M5: GitHub install only for now.

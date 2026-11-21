@@ -16,8 +16,8 @@ From the command line you can then:
 
 ## Status
 
-Early, but the tool is usable end to end: reading, calling, setting, game tools,
-an interactive shell and `eval`. Hardening comes next.
+Usable end to end: reading, calling, setting, game tools, an interactive shell,
+`eval`, strict mode and audit. Version 0.1.0, installable from GitHub.
 
 - **M0 spike, done.** It proved the approach on PySynthRack, a modular
   synthesiser built on DearPyGui and sounddevice: attach in about 50-80 ms, a
@@ -45,6 +45,10 @@ an interactive shell and `eval`. Hardening comes next.
   asyncio coroutines and a deny list. On PySynthRack, 200 evals on the main
   loop with audio on caused 0 dropouts. Details:
   [`docs/M4-results.md`](docs/M4-results.md).
+- **M5 hardening, done.** M5 adds strict mode (`exposure.serve()`), an audit
+  log, free-threaded 3.14t support and CI on Windows and Linux. A stress test
+  ran 1000 attach/detach cycles in 51 s with nothing leaked. Details:
+  [`docs/M5-results.md`](docs/M5-results.md).
 
 ## Requirements
 
@@ -272,7 +276,7 @@ client says so instead of hanging.
 - **M2**: function calls and variable sets on the main loop. Done.
 - **M3**: tools for games and GUIs: watch, tweak, pause and step. Done.
 - **M4**: interactive REPL, eval/exec, asyncio, output capture. Done.
-- **M5**: hardening.
+- **M5**: hardening. Done.
 - **Later**: remote attach over TLS.
 
 ## Security

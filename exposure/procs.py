@@ -213,6 +213,16 @@ def is_alive(pid: int) -> bool:
         return False
     except PermissionError:
         return True
+    if sys.platform.startswith("linux"):
+        # a process that has exited but not been reaped yet (a zombie) still
+        # answers signal 0; it isn't running Python any more
+        try:
+            with open(f"/proc/{pid}/stat", "rb") as f:
+                stat = f.read().decode("utf-8", "replace")
+            if stat[stat.rindex(")") + 2:].split()[0] in ("Z", "X"):
+                return False
+        except (OSError, ValueError, IndexError):
+            pass
     return True
 
 
