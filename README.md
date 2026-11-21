@@ -49,6 +49,13 @@ Usable end to end: reading, calling, setting, game tools, an interactive shell,
   log, free-threaded 3.14t support and CI on Windows and Linux. A stress test
   ran 1000 attach/detach cycles in 51 s with nothing leaked. Details:
   [`docs/M5-results.md`](docs/M5-results.md).
+- **M6 polish and bells, done.** M6 adds:
+  - logpoints, function traces and breakpoints (including "break when");
+  - snapshots and diffs;
+  - hot reload of edited modules into the running program;
+  - a browser debug panel with graphs and sliders.
+
+  Details: [`docs/M6-results.md`](docs/M6-results.md).
 
 ## Requirements
 
@@ -209,6 +216,40 @@ program's own output from other threads still goes where it always did.
 Personal defaults go in `%APPDATA%\exposure\config.toml` (or
 `~/.config/exposure/config.toml`), for example `[client] confirm = false`.
 
+### Debugging tools (M6)
+
+```
+exposure log 41872 game.py:120 "player.pos, player.hp" --when "player.hp < 20"
+exposure trace 41872 Enemy.take_damage          # every call: args, result, time, thread
+exposure logs 41872                             # stream what they print (Ctrl+C stops)
+exposure break 41872 --when "len(enemies) == 0" # pause the loop the moment it's true
+exposure break 41872 game.py:120                # pause at the frame after that line runs
+exposure snap 41872 before world                # ...do something in the game...
+exposure diff 41872 before                      # what changed in `world` since then
+exposure reload 41872 game.enemies              # edited the file? swap the new code in live
+exposure reload 41872 --undo
+exposure panel 41872 --preset hud               # a debug panel in your browser
+```
+
+- **Logpoints, traces and breakpoints** hook only the code they're on, and
+  each is rate-limited. One on the hot line of a 230 fps loop didn't change
+  the frame time.
+- **Hot reload** swaps the new code into the existing function objects. Live
+  objects, bound methods and `from x import f` references all pick it up,
+  while module state is kept.
+- **The panel** is a local page:
+  - live values with graphs, sliders for tweakable values, action buttons,
+    pause/step, and a log pane;
+  - it's guarded by a random token, a Host check and JSON-only POSTs.
+
+  Presets can define its sliders; `examples/pysynthrack.toml` has amp and
+  gain sliders for PySynthRack.
+
+In the shell:
+
+- `?thing` shows a signature and docstring, and `src thing` shows the source.
+- `ls self *widget*` filters a listing.
+
 ### Rate limiting
 
 The agent works in 2 ms slices with GIL-releasing pauses between them, and
@@ -277,6 +318,7 @@ client says so instead of hanging.
 - **M3**: tools for games and GUIs: watch, tweak, pause and step. Done.
 - **M4**: interactive REPL, eval/exec, asyncio, output capture. Done.
 - **M5**: hardening. Done.
+- **M6**: polish and bells (probes, snapshots, hot reload, browser panel). Done.
 - **Later**: remote attach over TLS.
 
 ## Security

@@ -413,6 +413,26 @@ Done. Full write-up in `docs/M5-results.md`.
 - **CI**: GitHub Actions on windows-latest and ubuntu-24.04, with 3.14 and
   3.14t.
 
+### M6 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M6-results.md`.
+- **Polish**: `?`/`doc`/`src`, `ls` globs, sparklines and min/max in the
+  panels, Tab completion of actions and presets, and a heavy-command warning
+  on real-time targets. Dropped clients are tidied after a 60 s grace, while a
+  clean "bye" keeps the session until the idle timeout.
+- **Probes**: logpoints, function traces, line breakpoints and per-frame
+  "break when", all on local `sys.monitoring` events with per-probe rate
+  limits. No frame-time change on a 230 fps loop. CPython reports no events
+  for calls run inside our own monitoring callback, so `exposure call` on
+  the main loop isn't seen by probes.
+- **snap/diff** of a subtree, with safe reads only.
+- **Hot reload**: rebinds `__code__` in place, keeps module values, and has
+  undo. It found the `__future__`-flag leak, now fixed with
+  `dont_inherit=True`.
+- **Browser panel**: client-side and stdlib-only, guarded by a token, a Host
+  check and JSON-only POSTs. Presets define its sliders, and PySynthRack has
+  a `panel` preset.
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.
