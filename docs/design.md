@@ -372,6 +372,25 @@ Done. Full write-up in `docs/M3-results.md`.
   kept rendering while the main loop was paused.
 - **Tests**: 68, passing on Windows and Linux (xvfb).
 
+### M4 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M4-results.md`.
+- **`exposure shell`**: a cmd-based REPL with `!python`, `py` mode, frame
+  selection, completion via the agent, history and paging.
+- **`eval`/`exec`**: client confirmation, plus an agent-side `confirmed`
+  flag. A scratch namespace or a live frame (PEP 667), `<exposure-eval-N>`
+  tracebacks, `_`, and `@N` handles.
+- **Output capture** through a ContextVar router on stdout/stderr, restored on
+  detach.
+- **asyncio**: an executor mode for a running loop, and awaiting coroutine
+  results.
+- **`[safety] deny`** for calls (a warning only for eval), and a user
+  `config.toml`.
+- **Two real bugs found live and fixed**: the detach/re-attach race (merged
+  with the coordinator's patch), and stale agent code surviving a re-attach.
+- **PySynthRack with audio on**: 200 captured evals on the main loop caused 0
+  xruns and left the frame time unchanged.
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.

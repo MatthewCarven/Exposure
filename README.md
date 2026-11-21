@@ -16,8 +16,8 @@ From the command line you can then:
 
 ## Status
 
-Early: reading, calling, setting and the game tools work; the REPL comes
-next.
+Early, but the tool is usable end to end: reading, calling, setting, game tools,
+an interactive shell and `eval`. Hardening comes next.
 
 - **M0 spike, done.** It proved the approach on PySynthRack, a modular
   synthesiser built on DearPyGui and sounddevice: attach in about 50-80 ms, a
@@ -40,6 +40,11 @@ next.
   repeated calls and saved presets. With PySynthRack's audio on, none of them
   caused a dropout, and the audio played on through a pause. Details:
   [`docs/M3-results.md`](docs/M3-results.md).
+- **M4 shell and eval, done.** M4 adds an interactive shell with completion
+  and history, `eval`/`exec` with confirmation, output capture, awaiting
+  asyncio coroutines and a deny list. On PySynthRack, 200 evals on the main
+  loop with audio on caused 0 dropouts. Details:
+  [`docs/M4-results.md`](docs/M4-results.md).
 
 ## Requirements
 
@@ -146,6 +151,35 @@ step = { "player.speed" = 0.1 }
 rate = 10
 ```
 
+### Shell and Python (M4)
+
+```
+exposure shell 41872                       # interactive: every command, no PID to retype
+exposure eval 41872 "len(enemies)"         # any Python; asks first (--yes skips)
+exposure exec 41872 "player.hp = 100; print(player)" --frame main
+```
+
+In the shell:
+
+- `!expr` runs a line of Python, and `py` makes every line Python.
+- `frame App.run` runs Python inside that live frame.
+- Tab completes commands, paths and handles (on Windows, install `pyreadline3`
+  for Tab and history).
+- History is kept between sessions, and long listings are paged.
+
+Anything printed during `eval`, `exec` or `call` comes back to you; the
+program's own output from other threads still goes where it always did.
+
+- Coroutines (`async def`) are awaited on the program's asyncio loop.
+- Tracebacks show the lines you typed.
+- `eval`/`exec` need confirmation. They're refused under `--read-only`, and
+  outside the reachable scope unless `[safety] eval = true`.
+- `[safety] deny = ["os.system", "subprocess.*"]` blocks those as `call`
+  targets. For `eval` it's only a warning, because Python can't be sandboxed.
+
+Personal defaults go in `%APPDATA%\exposure\config.toml` (or
+`~/.config/exposure/config.toml`), for example `[client] confirm = false`.
+
 ### Rate limiting
 
 The agent works in 2 ms slices with GIL-releasing pauses between them, and
@@ -212,7 +246,7 @@ client says so instead of hanging.
 - **M1**: read-only attach with an allowlist scope. Done.
 - **M2**: function calls and variable sets on the main loop. Done.
 - **M3**: tools for games and GUIs: watch, tweak, pause and step. Done.
-- **M4**: interactive REPL.
+- **M4**: interactive REPL, eval/exec, asyncio, output capture. Done.
 - **M5**: hardening.
 - **Later**: remote attach over TLS.
 
