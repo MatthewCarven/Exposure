@@ -36,6 +36,7 @@ Loop:     pause [S]  step [N]  resume  frames [N]  executors
 Panels:   watch PATH...  tweak PATH [STEP]  preset NAME  presets      (Ctrl+C returns here)
 Probes:   log FILE:LINE EXPR [--when C]  trace FUNC  break FILE:LINE | break when COND
           logs (stream)  probes  unlog|untrace|unbreak [ID|all]
+Compare:  snap NAME PATH  diff NAME [OTHER]  snaps
 Python:   !EXPR | eval EXPR | exec CODE (alone: type lines, blank line runs) | py (toggle)
           frame PATH (run Python in that frame; `frame` alone = scratch)  scratch [clear]
 Session:  confirm on|off  release [@N...]  detach  quit
@@ -375,6 +376,20 @@ class Shell(cmd.Cmd):
             return
         res = self.c.break_(rest or None, when=when, keep=keep or None, confirmed=bool(when))
         self._emit(cli.print_probe, res)
+
+    def do_snap(self, arg):
+        name, _, target = arg.strip().partition(" ")
+        if not target.strip():
+            self.stdout.write("usage: snap NAME PATH\n")
+            return
+        self._show("snap", self.c.snap(name, target.strip()))
+
+    def do_diff(self, arg):
+        parts = arg.split()
+        self._show("diff", self.c.diff(parts[0], parts[1] if len(parts) > 1 else None))
+
+    def do_snaps(self, arg):
+        self._show("snaps", self.c.snaps())
 
     def do_logs(self, arg):
         self._stream()

@@ -416,6 +416,19 @@ class Client:
             time.sleep(poll)
         return n
 
+    # -- M6: snapshots ---------------------------------------------------------------------
+    def snap(self, name, target, *, depth=None):
+        return self.request("snap", name=name, target=exprs.parse_target(target), depth=depth)
+
+    def diff(self, a, b=None):
+        return self.request("diff", a=a, b=b)
+
+    def snaps(self):
+        return self.request("snaps")
+
+    def unsnap(self, name="all"):
+        return self.request("unsnap", name=name)
+
     def scratch(self, clear=False):
         return self.request("scratch", clear=clear)
 

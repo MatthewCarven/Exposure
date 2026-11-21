@@ -196,6 +196,14 @@ def build_parser():
     s.add_argument("--count", type=int, help="stop after N lines")
     s.add_argument("--all", action="store_true", help="include what's already buffered")
     sub.add_parser("probes", parents=[parent], help="list logpoints, traces and breakpoints")
+    s = sub.add_parser("snap", parents=[parent], help="snapshot a subtree (for diff)")
+    s.add_argument("name")
+    s.add_argument("target")
+    s.add_argument("--depth", type=int, help="levels to record (default 4)")
+    s = sub.add_parser("diff", parents=[parent], help="what changed since a snapshot")
+    s.add_argument("a")
+    s.add_argument("b", nargs="?", help="another snapshot (default: now)")
+    sub.add_parser("snaps", parents=[parent], help="list snapshots")
     for name in ("unlog", "untrace", "unbreak", "unprobe"):
         s = sub.add_parser(name, parents=[parent], help="remove a probe (or all)")
         s.add_argument("probe", nargs="?", default="all")
@@ -332,6 +340,19 @@ def print_src(res):
         print("  ... (truncated)")
 
 
+def print_diff(res):
+    n = res["counts"]
+    _line(f"{res['target']}: {res['a']} -> {res['b']} ({res['seconds_apart']} s apart): "
+          f"{n['changed']} changed, {n['added']} added, {n['removed']} removed, "
+          f"{n['same']} the same" + ("  (snapshot truncated)" if res["truncated"] else ""))
+    for path, old, new in res["changed"]:
+        _line(f"  ~ {path}: {old} -> {new}")
+    for path, value in res["added"]:
+        _line(f"  + {path}: {value}")
+    for path, value in res["removed"]:
+        _line(f"  - {path}: {value}")
+
+
 def print_probe(res):
     what = res.get("spec") or res.get("when")
     extra = f"  when {res['source']}" if res.get("kind") == "break" and res.get("source") \
@@ -440,6 +461,13 @@ def print_result(cmd, res):
         print_job(res)
     elif cmd == "doc":
         print_doc(res)
+    elif cmd == "diff":
+        print_diff(res)
+    elif cmd == "snaps":
+        if not res:
+            print("no snapshots")
+        _table([(x["name"], x["target"], x["values"], x["age_s"]) for x in res],
+               ["name", "target", "values", "age s"], flex=1)
     elif cmd == "probes":
         if not res:
             print("no probes")
@@ -594,6 +622,12 @@ def main(argv=None) -> int:
                 return _follow(c, 0 if args.all else None, args.seconds, args.count)
             elif args.cmd == "probes":
                 res = c.probes()
+            elif args.cmd == "snap":
+                res = c.snap(args.name, args.target, depth=args.depth)
+            elif args.cmd == "diff":
+                res = c.diff(args.a, args.b)
+            elif args.cmd == "snaps":
+                res = c.snaps()
             elif args.cmd in ("unlog", "untrace", "unbreak", "unprobe"):
                 res = c.unprobe(args.probe)
             elif args.cmd == "set":

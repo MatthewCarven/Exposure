@@ -250,6 +250,7 @@ class Agent:
         self.pauser = None
         self.probes = probes_mod.Probes(on_break=self._probe_break)
         self.frame_breaks = {}        # id -> (watcher fn, text)
+        self.snaps = {}               # name -> snapshot (snap / diff)
         self.repeats = {}
         self._repeat_ids = 0
         self._captures = {}           # job id -> _Capture, read by _job_report
@@ -2106,6 +2107,102 @@ class Agent:
 
     def cmd_probe_events(self, since=0, limit=500):
         return self.probes.read(int(since), int(limit))
+
+    # =====================================================================================
+    # M6: snapshots and diffs
+    # =====================================================================================
+
+    def _summary(self, value):
+        """What a snapshot records for one value: built-in scalars and text as
+        their safe preview, containers by type and size (their items are
+        recorded as children), other objects by type."""
+        if isinstance(value, inspector.NotEvaluated):
+            return "<property>"
+        if type(value) in inspector.SCALARS or type(value) in inspector.TEXT:
+            return inspector.preview(value)
+        kind, items = inspector.container_items(value, self.budget.tick)
+        if kind is not None:
+            return f"{type(value).__name__}[{len(items)}]"
+        return f"<{inspector.type_name(value)}>"
+
+    def _take_snapshot(self, target, depth=4, max_nodes=5000):
+        obj, _perm = self._resolve(target)
+        values = {target: self._summary(obj)}
+        seen = {id(obj): target}
+        queue = collections.deque([(target, obj, 0)])
+        truncated = False
+        while queue:
+            path, o, d = queue.popleft()
+            if d >= depth or isinstance(o, (types.ModuleType, type, types.FunctionType,
+                                            types.FrameType, inspector.NotEvaluated)):
+                continue
+            try:
+                kids = inspector.children(o, self.budget.tick)
+            except Exception:
+                continue
+            for label, seg, _kind, value in kids:
+                self.budget.tick()
+                if len(values) >= max_nodes:
+                    truncated = True
+                    break
+                cpath = path + (paths.format_segments([seg]) if seg is not None
+                                else f"[{label}]")
+                values[cpath] = self._summary(value)
+                if inspector.needs_handle(value) and not isinstance(value,
+                                                                    inspector.NotEvaluated):
+                    if id(value) in seen:
+                        values[cpath] += f"  (same object as {seen[id(value)]})"
+                        continue
+                    seen[id(value)] = cpath
+                    queue.append((cpath, value, d + 1))
+            if truncated:
+                break
+        return {"target": target, "time": time.time(), "depth": depth, "values": values,
+                "truncated": truncated}
+
+    def cmd_snap(self, name, target, depth=4, max_nodes=5000):
+        snap = self._take_snapshot(target, int(depth), int(max_nodes))
+        self.snaps[str(name)] = snap
+        return {"name": name, "target": target, "values": len(snap["values"]),
+                "truncated": snap["truncated"]}
+
+    def cmd_snaps(self):
+        return [{"name": n, "target": s["target"], "values": len(s["values"]),
+                 "age_s": round(time.time() - s["time"], 1), "truncated": s["truncated"]}
+                for n, s in self.snaps.items()]
+
+    def cmd_unsnap(self, name=None):
+        if name in (None, "all"):
+            n = len(self.snaps)
+            self.snaps.clear()
+            return {"removed": n}
+        return {"removed": int(self.snaps.pop(str(name), None) is not None)}
+
+    def cmd_diff(self, a, b=None, limit=500):
+        """Compare snapshot ``a`` with snapshot ``b``, or with the same subtree
+        now (``b`` omitted or "now")."""
+        if a not in self.snaps:
+            raise LookupError(f"no snapshot {a!r} (have: {sorted(self.snaps)})")
+        old = self.snaps[a]
+        if b in (None, "", "now"):
+            new = self._take_snapshot(old["target"], old["depth"])
+            b_name = "now"
+        else:
+            if b not in self.snaps:
+                raise LookupError(f"no snapshot {b!r}")
+            new, b_name = self.snaps[b], b
+        ov, nv = old["values"], new["values"]
+        changed = [[p, ov[p], nv[p]] for p in ov if p in nv and ov[p] != nv[p]]
+        added = [[p, nv[p]] for p in nv if p not in ov]
+        removed = [[p, ov[p]] for p in ov if p not in nv]
+        lim = int(limit)
+        return {"a": a, "b": b_name, "target": old["target"],
+                "changed": changed[:lim], "added": added[:lim], "removed": removed[:lim],
+                "counts": {"changed": len(changed), "added": len(added),
+                           "removed": len(removed), "same": len(ov) - len(changed)
+                           - len(removed)},
+                "seconds_apart": round(new["time"] - old["time"], 2),
+                "truncated": old["truncated"] or new["truncated"]}
 
     def cmd_scratch(self, clear=False):
         if clear:

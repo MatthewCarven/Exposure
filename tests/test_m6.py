@@ -232,3 +232,42 @@ def test_shell_probes(make_target):
     text = out.getvalue()
     assert "log 1 added" in text and ": frame = " in text
     assert "break when" in text and "PAUSED" in text
+
+
+# -- part 3: snapshots ---------------------------------------------------------------------------
+
+@needs_314
+def test_snap_and_diff(make_target):
+    t = make_target(script="game_loop.py")
+    with Client.attach(t.pid) as c:
+        r = c.snap("before", "player")
+        assert r["values"] >= 5 and not r["truncated"]
+        c.nudge("player.hp", -25)
+        c.set("player.speed", "3.0")
+        d = c.diff("before")
+        changed = {p: (o, n) for p, o, n in d["changed"]}
+        assert changed["player.hp"] == ("100", "75")
+        assert changed["player.speed"] == ("1.5", "3.0")
+        assert "player.pos[0]" in changed                  # the loop moves it every frame
+        assert d["b"] == "now" and d["counts"]["removed"] == 0
+        c.snap("s1", "settings")
+        c.set('settings["volume"]', "0.9")
+        c.call('settings.update(extra=1)')
+        c.snap("s2", "settings")
+        d = c.diff("s1", "s2")
+        assert sorted(map(tuple, d["changed"])) == [("settings", "dict[2]", "dict[3]"),
+                                                    ("settings['volume']", "0.5", "0.9")]
+        assert d["added"] == [["settings['extra']", "1"]]
+        assert {x["name"] for x in c.snaps()} == {"before", "s1", "s2"}
+        with pytest.raises(Exception, match="no snapshot"):
+            c.diff("nope")
+        assert c.unsnap()["removed"] == 3
+
+
+def test_print_diff(capsys):
+    cli.print_diff({"target": "player", "a": "x", "b": "now", "seconds_apart": 1.0,
+                    "truncated": False, "changed": [["player.hp", "100", "75"]],
+                    "added": [["player.new", "1"]], "removed": [],
+                    "counts": {"changed": 1, "added": 1, "removed": 0, "same": 4}})
+    out = capsys.readouterr().out
+    assert "~ player.hp: 100 -> 75" in out and "+ player.new: 1" in out
