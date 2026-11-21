@@ -355,6 +355,23 @@ Done. Full write-up in `docs/M2-results.md`.
   `_param_widgets` entries, so after loading a patch `_mirror_param` updates a
   deleted widget and the slider doesn't move.
 
+### M3 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M3-results.md`.
+- **Commands**: `pause`/`step`/`resume`/`paused`, `watch`, `tweak`,
+  `preset`/`presets`, `nudge`, `find type:X|name:pattern [--via gc]`, and
+  `every`/`repeats`/`stop`.
+- **Pause** is a queued job that holds the main thread between iterations.
+  Calls and sets still run while paused, and `step N` re-pauses after exactly
+  N iterations. It ends on `--for`, detach or the idle timeout, but not on
+  client disconnect, since one-shot CLI calls disconnect every time.
+- **Panel**: one terminal panel for watch, tweak and presets, with changed
+  values highlighted and arrow-key nudges that are undoable.
+- **PySynthRack with audio on**: 0 xruns during a 10-value watch at 10 Hz, a
+  graph and a gc `find`, and a 2.8 s pause with `step 10`. The audio callback
+  kept rendering while the main loop was paused.
+- **Tests**: 68, passing on Windows and Linux (xvfb).
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.
@@ -367,9 +384,11 @@ Done. Full write-up in `docs/M2-results.md`.
 
 ## 9. Open questions for you
 
-1. ~~What does "tracked by main()" mean?~~ **Answered:** everything reachable from main, and/or an explicit allowlist for tight security. Now in §3. Remaining question: for strict mode, are you happy that the target has to opt in with one line of code (`exposure.serve(...)`), given that attach-by-PID can't be made truly locked down?
-2. **How much should Exposure be allowed to do by default?** Options: full power (calls, sets, eval) out of the box with confirmations, or read-only by default and you opt in to writing per session. I lean full power with confirmations on `eval` only, since this is a personal debugging tool.
-3. **Which platforms matter first?** You seem to be on Windows. Is Windows-first fine, with Linux right behind, and macOS (which needs root to attach) later?
+All answered (Matthew accepted every recommendation, 21 Nov 2026).
+
+1. ~~What does "tracked by main()" mean?~~ **Answered:** everything reachable from main, and/or an explicit allowlist for tight security. Now in §3. **Strict mode: answered.** A one-line `exposure.serve(policy=...)` opt-in in the target is fine.
+2. ~~How much should Exposure be allowed to do by default?~~ **Answered:** full power by default (calls and sets, as M2 ships). Confirmation only on `eval`/`exec` when that lands in M4. `--read-only` is the opt-in for careful sessions.
+3. ~~Which platforms matter first?~~ **Answered:** Windows first, Linux right behind (both tested from M1 on), macOS later.
 4. ~~What kind of programs?~~ **Answered:** GUI apps and games. Now in §4.5, and main-loop execution moved up to M2. First target is PySynthRack (DearPyGui + sounddevice), now in §4.6. **Answered:** yes to a separate Python 3.14 venv (`.venv314`) for PySynthRack, MIDI input optional until python-rtmidi ships a 3.14 wheel.
-5. **CLI style:** one-shot commands, an interactive REPL, or both? (The plan does both, REPL-first.)
-6. **Is the name "Exposure" final**, and do you want it published on PyPI eventually, or kept as a personal tool?
+5. ~~CLI style?~~ **Answered:** both one-shot commands (shipping now) and an interactive REPL (M4).
+6. ~~Is the name final, and PyPI?~~ **Answered:** keep the name Exposure. `exposure` is already taken on PyPI, so if it's ever published, use a distribution name such as `exposure-debugger` (free as of 21 Nov 2026), with the import name still `exposure`. Decide on publishing at M5.

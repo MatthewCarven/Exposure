@@ -16,7 +16,7 @@ From the command line you can then:
 
 ## Status
 
-Early: reading, calling and setting work; the game tools and the REPL come
+Early: reading, calling, setting and the game tools work; the REPL comes
 next.
 
 - **M0 spike, done.** It proved the approach on PySynthRack, a modular
@@ -35,6 +35,11 @@ next.
   PySynthRack, 300 parameter changes made through `call` caused 0 dropouts,
   and a level meter confirmed the change in the audio itself. Details:
   [`docs/M2-results.md`](docs/M2-results.md).
+- **M3 game tools, done.** M3 adds a live watch panel, arrow-key tweaking,
+  pause and frame-by-frame stepping of the main loop, `find` for live objects,
+  repeated calls and saved presets. With PySynthRack's audio on, none of them
+  caused a dropout, and the audio played on through a pause. Details:
+  [`docs/M3-results.md`](docs/M3-results.md).
 
 ## Requirements
 
@@ -105,6 +110,42 @@ Inspection never runs the target's own code. That means no `__repr__`, no
 properties, and no subclass overrides of container methods. Properties show
 as "not evaluated".
 
+### Game tools (M3)
+
+```
+exposure watch 41872 player.pos player.hp "len(enemies)"   # live panel, 10 Hz
+exposure tweak 41872 player.speed --step 0.1               # arrow keys nudge it live
+exposure pause 41872                                       # freeze between frames
+exposure step 41872 5                                      # advance exactly 5 frames
+exposure resume 41872
+exposure find 41872 type:Enemy                             # live instances, as handles
+exposure find 41872 "name:*speed*"
+exposure every 41872 1s "spawn_enemy()"                    # until `exposure stop 41872`
+exposure preset 41872 hud                                  # a saved panel from exposure.toml
+```
+
+In the panel, Up/Down nudge the selected value (Shift or PgUp/PgDn for x10),
+Tab switches between values, typing a number then Enter sets it, `u` undoes,
+`p` pauses, `s` steps one frame and `q` quits. Changed values are
+highlighted.
+
+While paused, calls, sets and reads still work, so you can look at and edit
+one consistent frame. Other threads keep running: PySynthRack's audio played
+on through a pause. A paused GUI looks frozen to the OS: Windows says
+"Not Responding" after about 5 s. A pause ends on `resume`, after
+`pause --for S`, on detach, or when the idle timeout notices nobody is
+connected.
+
+A preset is a saved panel:
+
+```toml
+[presets.hud]
+watch = ["player.pos", "player.hp", "len(enemies)"]
+tweak = ["player.speed", "gravity"]
+step = { "player.speed" = 0.1 }
+rate = 10
+```
+
 ### Rate limiting
 
 The agent works in 2 ms slices with GIL-releasing pauses between them, and
@@ -170,7 +211,7 @@ client says so instead of hanging.
 
 - **M1**: read-only attach with an allowlist scope. Done.
 - **M2**: function calls and variable sets on the main loop. Done.
-- **M3**: tools for games and GUIs: watch, tweak, pause and step.
+- **M3**: tools for games and GUIs: watch, tweak, pause and step. Done.
 - **M4**: interactive REPL.
 - **M5**: hardening.
 - **Later**: remote attach over TLS.

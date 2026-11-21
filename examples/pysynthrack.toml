@@ -21,3 +21,12 @@ pressure = "<entry>:self.backend._xruns"   # back off if the audio starts droppi
 [actions]
 param = "self._mirror_param"     # param MODULE_ID "NAME" VALUE
 audio = "self._on_toggle_audio"  # start / stop audio
+
+# exposure preset PID levels: a live panel of the audio engine. Change params
+# with `do param` (it goes through _mirror_param: model, backend and widget);
+# a tweak of params[...] directly would skip the backend notice and the widget,
+# and isn't allowlisted here anyway.
+[presets.levels]
+watch = ["self.backend._xruns", "self.backend._dsp_load", "self.backend._dsp_load_peak",
+         "self.backend._audio_levels", "len(self.patch.modules)", "self._buffer_size"]
+rate = 10
