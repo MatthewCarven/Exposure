@@ -37,8 +37,10 @@ def private_session_dir(tmp_path_factory):
 
 
 class Target:
-    def __init__(self, *args, cwd=None, script="app_main.py"):
+    def __init__(self, *args, cwd=None, script="app_main.py", env=None):
+        extra = env or {}
         env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", QT_QPA_PLATFORM="offscreen")
+        env.update(extra)
         # let the base interpreter see this venv's packages (PySide6 for the Qt target)
         env["PYTHONPATH"] = os.pathsep.join([*site.getsitepackages(),
                                              env.get("PYTHONPATH", "")]).rstrip(os.pathsep)

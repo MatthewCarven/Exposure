@@ -1,0 +1,49 @@
+name: tests
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  test:
+    name: ${{ matrix.os }} / Python ${{ matrix.python }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            python: "3.14"
+          # pinned: ubuntu-latest moving to a new release broke PySynthRack's CI
+          - os: ubuntu-24.04
+            python: "3.14"
+          - os: ubuntu-24.04
+            python: "3.14t"        # free-threaded build (no GIL)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+
+      - name: Linux display and Qt libraries
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libegl1 libgl1 libxkbcommon-x11-0 libxcb-cursor0 \
+            libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 libdbus-1-3
+
+      - name: Test dependencies
+        run: python -m pip install pytest
+
+      - name: PySide6 for the Qt test (no free-threaded wheels yet)
+        if: ${{ !endsWith(matrix.python, 't') }}
+        run: python -m pip install PySide6-Essentials
+
+      - name: Tests (Windows)
+        if: runner.os == 'Windows'
+        run: python -m pytest -q
+
+      - name: Tests (Linux, under Xvfb for the Tk and Qt tests)
+        if: runner.os == 'Linux'
+        run: xvfb-run -a python -m pytest -q

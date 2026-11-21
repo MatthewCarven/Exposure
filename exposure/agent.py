@@ -219,7 +219,14 @@ class Agent:
         self.requests = 0
         self.errors = 0
         self.read_only = bool(config.get("read_only"))
-        self.idle_timeout = float(config.get("idle_timeout", 1800))  # seconds; 0 = never
+        # served: started by the program itself with exposure.serve(); a client's
+        # detach ends its session but the agent keeps serving. strict: eval/exec
+        # off, scope from the program's policy only (see design section 3.1.1).
+        self.served = bool(config.get("served"))
+        self.strict = bool(config.get("strict"))
+        default_idle = 0 if self.served else 1800
+        self.idle_timeout = float(config.get("idle_timeout", default_idle))  # 0 = never
+        self.audit_path = config.get("audit_log")
         self.frame_budget_s = float(config.get("frame_budget_ms", 2.0)) / 1000.0
         self.last_activity = time.time()
         self.executors = {}           # key -> ThreadExecutor
@@ -228,6 +235,10 @@ class Agent:
         self.changes = []             # undo log / history, oldest first
         self._change_ids = 0
         self.idle_detached = False
+        # Free-threaded 3.14t has no GIL to make `x += 1` or check-then-act on
+        # shared lists atomic; connection threads, job threads and the target's
+        # own threads all touch the agent, so these go under one small lock.
+        self._state_lock = threading.RLock()
         self._conn_seq = 0
         self._open_conns = 0
         self._conns = set()
@@ -247,7 +258,12 @@ class Agent:
         self.deny = list(safety.get("deny", [])) + list(config.get("deny") or [])
         self.policy_allows_eval = safety.get("eval") is True
         self.scope = (config.get("scope") or (self.policy.scope if self.policy else None)
+                      or ("explicit" if self.strict else None)
                       or ("both" if self._has_explicit() else "reachable"))
+        if self.strict and self.scope == "reachable":
+            self.scope = "both"     # strict never allows changes outside the policy
+        if not self.audit_path and self.policy:
+            self.audit_path = self.policy.agent.get("audit_log")
         if self.scope not in policy_mod.SCOPES:
             self.scope = "reachable"
         self.entry_spec = config.get("entry") or (self.policy.entry if self.policy else None)
@@ -265,9 +281,11 @@ class Agent:
 
     # -- lifecycle ---------------------------------------------------------------------
     def start(self):
+        sys.audit("exposure.attach", self.pid, "served" if self.served else "injected")
         self.write_session()
         atexit.register(self._remove_files)
         self.thread.start()
+        self._audit("attach", {"target": "served" if self.served else "injected"}, True, None)
 
     def ensure_alive(self):
         """Refresh the session file of a running agent. False if this agent is
@@ -315,6 +333,11 @@ class Agent:
         if self._cleaned:
             return
         self._cleaned = True
+        try:
+            sys.audit("exposure.detach", self.pid)
+            self._audit("detach", {}, True, None)
+        except BaseException:
+            pass
         for name, router in self._routers:      # put sys.stdout/stderr back
             try:
                 if getattr(sys, name) is router:
@@ -344,7 +367,9 @@ class Agent:
             self.sock.close()
         except BaseException:
             pass
-        for conn in list(self._conns):   # other clients: drop them too
+        with self._state_lock:
+            conns = list(self._conns)
+        for conn in conns:               # other clients: drop them too
             try:
                 conn.close()
             except BaseException:
@@ -376,7 +401,8 @@ class Agent:
                     break
                 # one thread per connection, so a long request (frames, a slow
                 # call) doesn't hold up another client
-                self._conn_seq += 1
+                with self._state_lock:
+                    self._conn_seq += 1
                 threading.Thread(target=self._conn_thread, args=(conn,), daemon=True,
                                  name=f"exposure-conn-{self._conn_seq}").start()
         except BaseException:
@@ -385,15 +411,17 @@ class Agent:
             self._cleanup()
 
     def _conn_thread(self, conn):
-        self._open_conns += 1
-        self._conns.add(conn)
+        with self._state_lock:
+            self._open_conns += 1
+            self._conns.add(conn)
         try:
             self._handle_conn(conn)
         except BaseException:
             pass
         finally:
-            self._open_conns -= 1
-            self._conns.discard(conn)
+            with self._state_lock:
+                self._open_conns -= 1
+                self._conns.discard(conn)
             self.last_activity = time.time()
             try:
                 conn.close()
@@ -422,19 +450,30 @@ class Agent:
             if rest:
                 time.sleep(rest)
             resp = self._dispatch(req)
+            detaching = (req.get("cmd") == "detach" and resp.get("ok")) if isinstance(
+                req, dict) else False
+            if detaching and not self.served:
+                # stop advertising *before* answering: once the client reads
+                # "detaching", the session file is already gone and new hellos
+                # are refused. The socket closes after the reply (closing it
+                # wakes the accept loop, whose cleanup drops open connections).
+                self.stop.set()
+                self._remove_files()
             try:
                 protocol.send_msg(conn, resp, default=inspector.preview)
             except (TypeError, ValueError) as exc:
                 protocol.send_msg(conn, {"id": resp.get("id"), "ok": False,
                                          "error": f"unserialisable result: {exc}"})
             rest = self.budget.end()
-            if req.get("cmd") == "detach" and resp.get("ok"):
-                self._begin_stop()
-                return
+            if detaching:
+                if not self.served:
+                    self._begin_stop()
+                return              # (a served agent keeps serving other sessions)
 
     def _dispatch(self, req):
         rid = req.get("id") if isinstance(req, dict) else None
-        self.requests += 1
+        with self._state_lock:
+            self.requests += 1
         self.last_activity = time.time()
         self.budget.begin()
         try:
@@ -443,14 +482,39 @@ class Agent:
             fn = getattr(self, "cmd_" + str(cmd), None) if isinstance(cmd, str) else None
             if fn is None:
                 return {"id": rid, "ok": False, "error": f"unknown command {cmd!r}"}
-            return {"id": rid, "ok": True, "result": fn(**args)}
+            result = fn(**args)
+            if cmd in _AUDITED:
+                self._audit(cmd, args, True, result)
+            return {"id": rid, "ok": True, "result": result}
         except BaseException as exc:
-            self.errors += 1
+            with self._state_lock:
+                self.errors += 1
             out = {"id": rid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
+            if isinstance(req, dict) and req.get("cmd") in _AUDITED:
+                self._audit(req.get("cmd"), req.get("args") or {}, False, out["error"])
             if not isinstance(exc, (LookupError, inspector.AccessDenied, paths.PathError,
                                     PermissionError, TypeError, ValueError)):
                 out["traceback"] = traceback.format_exc(limit=12)
             return out
+
+    def _audit(self, cmd, args, ok, result):
+        """Append one JSON line per change-making command to the audit log, if set."""
+        if not self.audit_path:
+            return
+        try:
+            what = args.get("target") or args.get("source") or args.get("action") or ""
+            rec = {"t": round(time.time(), 3), "pid": self.pid, "cmd": cmd,
+                   "what": str(what)[:500], "ok": ok}
+            if isinstance(result, dict):
+                for k in ("state", "error", "on", "old", "new", "job"):
+                    if k in result:
+                        rec[k] = result[k] if k != "error" else str(result[k])[:500]
+            elif not ok:
+                rec["error"] = str(result)[:500]
+            with open(self.audit_path, "a", encoding="utf-8") as f:
+                f.write(json.dumps(rec, default=str) + "\n")
+        except Exception:
+            pass
 
     # -- policy / explicit scope ---------------------------------------------------
     def _load_policy(self):
@@ -721,6 +785,7 @@ class Agent:
                 "agent": AGENT_VERSION, "protocol": protocol.PROTOCOL_VERSION,
                 "uptime_s": round(time.time() - self.started, 2),
                 "scope": self.scope, "entry": self.entry_spec or "(auto)",
+                "strict": self.strict, "served": self.served,
                 "requests": self.requests, "errors": self.errors,
                 "handles": len(self.handles), "budget": self.budget.stats(),
                 "config": {"entry": self.entry_spec, "scope": self.scope,
@@ -824,7 +889,7 @@ class Agent:
 
     def _ls_roots(self, explicit, limit, offset):
         rows = []
-        info = {"scope": self.scope}
+        info = {"scope": self.scope, "strict": self.strict}
         if self.scope != "explicit":
             try:
                 found = self._entry_matches()
@@ -937,6 +1002,16 @@ class Agent:
         return {"released": self.handles.release(ns)}
 
     def cmd_detach(self):
+        if self.served:
+            # the program started this agent itself: end the session, keep serving
+            for r in list(self.repeats.values()):
+                r["stop"].set()
+            if self.pauser is not None:
+                self.pauser.resume(timeout=2.0)
+            released = self.handles.release()
+            return {"detaching": False, "served": True, "handles_released": released,
+                    "note": "this agent was started by the program (exposure.serve); "
+                            "the session ended but the agent keeps serving"}
         return {"detaching": True, "handles_released": len(self.handles),
                 "jobs_still_running": len(self.jobs.pending())}
 
@@ -950,6 +1025,10 @@ class Agent:
 
     # -- executors -------------------------------------------------------------------------
     def _main_executor(self):
+        with self._state_lock:      # one executor per thread, even when
+            return self._main_executor_locked()   # two clients ask at once
+
+    def _main_executor_locked(self):
         tid = threading.main_thread().ident
         ex = self.executors.get(("main", tid))
         if ex is None:
@@ -965,6 +1044,10 @@ class Agent:
         return ex
 
     def _line_executor(self, tid):
+        with self._state_lock:      # one executor per thread, even when
+            return self._line_executor_locked(tid)   # two clients ask at once
+
+    def _line_executor_locked(self, tid):
         ex = self.executors.get(("line", tid))
         if ex is None:
             ex = executor_mod.ThreadExecutor(tid, budget_s=self.frame_budget_s)
@@ -992,6 +1075,10 @@ class Agent:
         raise ValueError(f"--on must be main, agent, loop or thread:NAME, not {on!r}")
 
     def _thread_executor(self, tid):
+        with self._state_lock:      # one executor per thread, even when
+            return self._thread_executor_locked(tid)   # two clients ask at once
+
+    def _thread_executor_locked(self, tid):
         """A named thread: its asyncio loop if it runs one, else its next line."""
         ex = self.executors.get(("thread", tid))
         if ex is None:
@@ -1064,9 +1151,12 @@ class Agent:
         job.awaiter = self._await_anywhere     # an asyncio executor swaps in its own
         cap = getattr(fn, "_capture", None)
         if cap is not None:
-            self._captures[job.id] = cap[1]
-            del self._captures_order[:-500]
-            self._captures_order.append(job.id)
+            with self._state_lock:
+                self._captures[job.id] = cap[1]
+                self._captures_order.append(job.id)
+                for old in self._captures_order[:-500]:
+                    self._captures.pop(old, None)
+                del self._captures_order[:-500]
         self.jobs.add(job)
         ex.submit(job)
         job.done.wait(float(timeout) if timeout is not None else 10.0)
@@ -1083,7 +1173,8 @@ class Agent:
         out["blocked_ms"] = job.blocked_ms
         if job.awaited:
             out["awaited"] = True
-        cap = self._captures.pop(job.id, None) if job.done.is_set() else None
+        with self._state_lock:
+            cap = self._captures.pop(job.id, None) if job.done.is_set() else None
         if cap is not None:
             text, truncated = cap.text()
             if text:
@@ -1276,8 +1367,9 @@ class Agent:
             raise TypeError("delta must be a number")
         sys.audit("exposure.set", target)
         ex = self._frame_executor(frame) if frame is not None else self._executor(on)
-        self._change_ids += 1
-        cid = self._change_ids
+        with self._state_lock:
+            self._change_ids += 1
+            cid = self._change_ids
 
         def fn():
             value = new if delta is None else self._nudged(kind, container, key, delta)
@@ -1288,11 +1380,12 @@ class Agent:
         job = self._run(fn, label, ex, timeout)
         if job.done.is_set() and job.ok:
             r = job.result
-            self.changes.append({"id": cid, "target": target, "kind": kind,
-                                 "container": container, "key": key, "old": r.old,
-                                 "existed": r.existed, "new": r.new, "frame": frame,
-                                 "on": on, "time": time.time(), "undone": False})
-            del self.changes[:-500]
+            with self._state_lock:
+                self.changes.append({"id": cid, "target": target, "kind": kind,
+                                     "container": container, "key": key, "old": r.old,
+                                     "existed": r.existed, "new": r.new, "frame": frame,
+                                     "on": on, "time": time.time(), "undone": False})
+                del self.changes[:-500]
         return self._job_report(job)
 
     def cmd_nudge(self, target, delta, on=None, timeout=10.0):
@@ -1317,7 +1410,8 @@ class Agent:
 
     def cmd_undo(self, n=1, timeout=10.0):
         self._check_writable()
-        todo = [c for c in self.changes if not c["undone"]][-int(n):]
+        with self._state_lock:
+            todo = [c for c in self.changes if not c["undone"]][-int(n):]
         out = []
         for c in reversed(todo):
             frame = c["frame"]
@@ -1400,6 +1494,10 @@ class Agent:
                      "keep running. Calls and sets still work while paused.")
 
     def _pauser(self):
+        with self._state_lock:      # one executor per thread, even when
+            return self._pauser_locked()   # two clients ask at once
+
+    def _pauser_locked(self):
         if self.pauser is None:
             self.pauser = executor_mod.Pauser(self._main_executor())
         return self.pauser
@@ -1553,8 +1651,9 @@ class Agent:
         fn = self._prepare_call(target, args, kwargs)
         interval = max(0.01, float(interval))
         ex = self._executor(on)
-        self._repeat_ids += 1
-        rid = self._repeat_ids
+        with self._state_lock:
+            self._repeat_ids += 1
+            rid = self._repeat_ids
         stop = threading.Event()
         rec = {"id": rid, "target": target, "interval": interval, "on": on or "main",
                "count": count, "runs": 0, "errors": 0, "last": None, "stop": stop,
@@ -1616,6 +1715,10 @@ class Agent:
     MAX_OUTPUT = 64 * 1024
 
     def _install_routers(self):
+        with self._state_lock:
+            self._install_routers_locked()
+
+    def _install_routers_locked(self):
         if self._routers:
             return
         for name in ("stdout", "stderr"):
@@ -1693,6 +1796,8 @@ class Agent:
         if not confirmed:
             raise PermissionError("eval/exec must be confirmed (the client asks first; "
                                   "`--yes` or `confirm off` in the shell skips the question)")
+        if self.strict:
+            raise PermissionError("strict mode (exposure.serve): eval/exec are disabled")
         if self.scope != "reachable" and not self.policy_allows_eval:
             raise PermissionError(f"{self.scope} scope: eval/exec is off unless the policy "
                                   "sets [safety] eval = true")
@@ -1704,8 +1809,9 @@ class Agent:
                 mode = "exec"
         if mode not in ("eval", "exec"):
             raise ValueError("mode must be eval, exec or auto")
-        self._eval_seq += 1
-        fname = f"<exposure-eval-{self._eval_seq}>"
+        with self._state_lock:
+            self._eval_seq += 1
+            fname = f"<exposure-eval-{self._eval_seq}>"
         code = compile(source, fname, mode)
         linecache.cache[fname] = (len(source), None, source.splitlines(True) or ["\n"], fname)
         extras = {"__exposure_h__": lambda n: self.handles.get(int(n))[0]}
@@ -1886,6 +1992,9 @@ class _SetResult:
 
 
 # -- entry point used by the bootstrap -------------------------------------------------
+
+_AUDITED = {"call", "set", "nudge", "undo", "do", "eval", "pause", "step", "resume",
+            "every", "stop", "detach"}
 
 _start_lock = threading.Lock()
 

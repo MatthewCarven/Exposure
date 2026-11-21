@@ -156,8 +156,9 @@ def test_audit_events(make_target):
         log = c.call("audit_log.copy()")["result"]
         h = log["handle"]
         items = [e["preview"] for e in c.ls(h)["entries"]]
-        assert items[:2] == ["tuple[2] ('exposure.call', 'where')",
-                             "tuple[2] ('exposure.set', 'player.hp')"]
+        assert items[0].startswith("tuple[2] ('exposure.attach', ")   # M5: attach event
+        assert items[1:3] == ["tuple[2] ('exposure.call', 'where')",
+                              "tuple[2] ('exposure.set', 'player.hp')"]
 
 
 @needs_314

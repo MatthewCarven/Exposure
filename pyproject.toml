@@ -3,15 +3,36 @@ requires = ["setuptools>=69"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "exposure"
+# The import name is `exposure`; "exposure" is taken on PyPI, so the
+# distribution is exposure-debugger (not published yet: install from GitHub).
+name = "exposure-debugger"
 version = "0.1.0"
-description = "Attach to a running Python 3.14+ process and inspect (later, control) it live."
+description = "Attach to a running Python 3.14+ process and inspect, call and change it live."
 readme = "README.md"
 license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.14"
 dependencies = []
+keywords = ["debugger", "remote debugging", "pep 768", "introspection", "games", "gui"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "Operating System :: Microsoft :: Windows",
+    "Operating System :: POSIX :: Linux",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.14",
+    "Programming Language :: Python :: Free Threading :: 2 - Beta",
+    "Topic :: Software Development :: Debuggers",
+]
+
+[project.urls]
+Homepage = "https://github.com/MatthewCarven/Exposure"
+Source = "https://github.com/MatthewCarven/Exposure"
 
 [project.optional-dependencies]
+# Tab completion and history in `exposure shell` on Windows (readline is built in elsewhere)
+shell = ["pyreadline3>=3.4; sys_platform == 'win32'"]
 dev = ["pytest>=8"]
 
 [project.scripts]
@@ -22,3 +43,5 @@ packages = ["exposure"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+markers = ["stress: long-running stress tests, skipped by default (run with -m stress)"]
+addopts = "-m 'not stress'"

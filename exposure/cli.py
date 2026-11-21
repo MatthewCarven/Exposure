@@ -247,7 +247,8 @@ def print_ls(res):
         if e:
             more = f", {e['matches']} matches" if e.get("matches", 1) > 1 else ""
             _line(f"entry {e['function']} {e['handle']} ({_short_path(e['file'])}:{e['line']}, "
-                  f"thread {e['thread']}{more})  scope: {res['scope']}")
+                  f"thread {e['thread']}{more})  scope: {res['scope']}"
+                  + ("  STRICT" if res.get("strict") else ""))
         elif res.get("entry_missing"):
             _line(f"entry {res['entry_missing']!r} not on any stack  scope: {res['scope']}")
     else:
@@ -504,6 +505,9 @@ def main(argv=None) -> int:
     except (exprs.ExprError, paths.PathError) as exc:
         print(f"exposure: {exc}", file=sys.stderr)
         return 2
+    except client_mod.ConnectionLost as exc:
+        print(f"exposure: {exc}", file=sys.stderr)
+        return 3
     except client_mod.RemoteError as exc:
         print(f"exposure: {exc}", file=sys.stderr)
         if exc.traceback:

@@ -106,6 +106,10 @@ class RemoteError(RuntimeError):
         self.traceback = traceback_text
 
 
+class ConnectionLost(RemoteError):
+    """The agent's connection dropped mid-request (target exited or detached)."""
+
+
 def _connect(pid: int, timeout=2.0):
     """Connect using an existing session file; None if there's no live agent."""
     try:
@@ -217,7 +221,7 @@ class Client:
                 try:
                     c = cls(pid, sock, hello, info)
                     c.ping()      # an agent mid-detach may accept, then drop us
-                except (OSError, ConnectionError, ValueError):
+                except (OSError, ConnectionError, ValueError, ConnectionLost):
                     sock.close()
                     sock = None
                     time.sleep(0.6)   # let it finish tidying up, then inject afresh
@@ -311,9 +315,16 @@ class Client:
     def request(self, cmd: str, **args):
         rid = self._next_id
         self._next_id += 1
-        protocol.send_msg(self.sock, {"id": rid, "cmd": cmd,
-                                      "args": {k: v for k, v in args.items() if v is not None}})
-        resp = protocol.recv_msg(self.sock)
+        try:
+            protocol.send_msg(self.sock, {"id": rid, "cmd": cmd,
+                                          "args": {k: v for k, v in args.items()
+                                                   if v is not None}})
+            resp = protocol.recv_msg(self.sock)
+        except (ConnectionError, OSError) as exc:
+            alive = procs.is_alive(self.pid)
+            why = ("the target is still running; the agent may have detached"
+                   if alive else f"process {self.pid} has exited")
+            raise ConnectionLost(f"lost the connection during `{cmd}`: {why} ({exc})") from None
         if not resp.get("ok"):
             raise RemoteError(resp.get("error", "unknown error"), resp.get("traceback"))
         return resp.get("result")

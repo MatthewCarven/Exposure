@@ -61,6 +61,11 @@ def boom():
     raise ValueError("kaboom")
 
 
+def blocked_by_audit():   # the --audit hook refuses calls to this one
+    calls.append(("blocked_by_audit ran",))
+    return "ran"
+
+
 audit_log = []
 
 
