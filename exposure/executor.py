@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import collections
 import dis
+import inspect
 import itertools
 import os
 import sys
@@ -39,7 +40,8 @@ MAX_JOBS = 200
 
 class Job:
     __slots__ = ("id", "fn", "label", "where", "created", "started", "finished",
-                 "ok", "result", "exc", "tb", "blocked_ms", "thread", "done", "not_before")
+                 "ok", "result", "exc", "tb", "blocked_ms", "thread", "done", "not_before",
+                 "awaiter", "awaited")
 
     def __init__(self, fn, label, where):
         self.id = next(_job_ids)
@@ -57,6 +59,8 @@ class Job:
         self.thread = None
         self.done = threading.Event()
         self.not_before = 0      # earliest executor iteration this may run on
+        self.awaiter = None      # callable(job, awaitable) -> True if it will finish the job
+        self.awaited = False
 
     def run(self):
         self.started = time.time()
@@ -66,18 +70,43 @@ class Job:
             self.result = self.fn()
             self.ok = True
         except BaseException as exc:  # never escape into the target's thread
-            self.ok = False
-            self.exc = exc
-            try:
-                te = traceback.TracebackException.from_exception(exc)
-                te.stack = traceback.StackSummary.from_list(
-                    [f for f in te.stack if not f.filename.startswith(_PKG_DIR)][-20:])
-                self.tb = "".join(te.format())
-            except BaseException:
-                self.tb = None
+            self._fail(exc)
         self.blocked_ms = round((time.perf_counter() - t0) * 1000, 3)
-        self.finished = time.time()
         self.fn = None
+        if self.ok and self.awaiter is not None and inspect.isawaitable(self.result):
+            try:
+                if self.awaiter(self, self.result):
+                    self.awaited = True
+                    return            # finish_future() completes the job later
+            except BaseException as exc:
+                self._fail(exc)
+        self.finished = time.time()
+        self.done.set()
+
+    def _fail(self, exc):
+        self.ok = False
+        self.exc = exc
+        try:
+            te = traceback.TracebackException.from_exception(exc)
+            te.stack = traceback.StackSummary.from_list(
+                [f for f in te.stack if not f.filename.startswith(_PKG_DIR)][-20:])
+            self.tb = "".join(te.format())
+        except BaseException:
+            self.tb = None
+
+    def finish_future(self, fut):
+        """Done-callback for an asyncio / concurrent future the result was handed to."""
+        try:
+            if fut.cancelled():
+                self._fail(RuntimeError("the awaited coroutine was cancelled"))
+            elif fut.exception() is not None:
+                self._fail(fut.exception())
+            else:
+                self.result = fut.result()
+                self.ok = True
+        except BaseException as exc:
+            self._fail(exc)
+        self.finished = time.time()
         self.done.set()
 
     @property
@@ -94,6 +123,25 @@ def _backward_jumps(code):
         if ins.opname.startswith("JUMP_BACKWARD") and ins.jump_target is not None:
             out.append((ins.offset, ins.jump_target))
     return out
+
+
+_RUN_FOREVER = ("BaseEventLoop.run_forever", "BaseEventLoop._run_once",
+                "BaseEventLoop.run_until_complete")
+
+
+def running_asyncio_loop(top):
+    """The asyncio event loop running on this stack, or None."""
+    f = top
+    while f is not None:
+        if f.f_code.co_qualname in _RUN_FOREVER and "asyncio" in f.f_code.co_filename:
+            loop = f.f_locals.get("self")
+            try:
+                if loop is not None and loop.is_running():
+                    return loop
+            except Exception:
+                pass
+        f = f.f_back
+    return None
 
 
 def find_loop_frame(top, prefer_code=None):
@@ -150,6 +198,7 @@ class ThreadExecutor:
         self._tk_root = None
         self._qt = None
         self.holding = False     # a pause is holding this thread
+        self._aloop = None
 
     # -- strategy -----------------------------------------------------------------
     def _top_frame(self):
@@ -167,6 +216,11 @@ class ThreadExecutor:
             if root is not None:
                 self._tk_root = root
                 return "tk"
+        loop = running_asyncio_loop(self._top_frame())
+        if loop is not None:
+            self._aloop = loop
+            return "asyncio"
+        if self.is_main:
             frame, edge = find_loop_frame(self._top_frame(), self.prefer_code)
             if frame is not None:
                 self.edge = (frame.f_code, edge[0], edge[1])
@@ -216,7 +270,7 @@ class ThreadExecutor:
         return bool(self.queue) or self.sampling is not None
 
     def _sync(self):
-        if self.mode in ("tk", "qt"):
+        if self.mode in ("tk", "qt", "asyncio"):
             return
         want = self._want()
         if want == self.enabled:
@@ -335,12 +389,34 @@ class ThreadExecutor:
         except BaseException as exc:
             self._note_error(exc)
 
+    # -- asyncio ------------------------------------------------------------------------
+    def _asyncio_run(self):
+        try:
+            self.iterations += 1
+            self._drain()
+            with self.lock:
+                more = bool(self.queue)
+            if more and not self.holding:
+                self._aloop.call_soon(self._asyncio_run)
+        except BaseException as exc:
+            self._note_error(exc)
+
+    def _await_here(self, job, awaitable):
+        """On the loop's own thread: wrap the awaitable in a task and finish the
+        job when it completes (never block the loop waiting for it)."""
+        import asyncio
+        fut = asyncio.ensure_future(awaitable, loop=self._aloop)
+        fut.add_done_callback(job.finish_future)
+        return True
+
     # -- agent-thread API --------------------------------------------------------------
     def submit(self, job: Job):
         with self.lock:
             if self.mode is None:
                 self.mode = self._pick_mode()
             job.where = self.mode      # known only now, on the first submit
+            if self.mode == "asyncio":
+                job.awaiter = self._await_here
             self.queue.append(job)
             self._sync()
             holding = self.holding
@@ -352,6 +428,8 @@ class ThreadExecutor:
                 self._tk_kick()
             elif self.mode == "qt":
                 self._qt_kick()
+            elif self.mode == "asyncio":
+                self._aloop.call_soon_threadsafe(self._asyncio_run)
         return job
 
     def sample(self, n, timeout):

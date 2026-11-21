@@ -28,8 +28,14 @@ class ExprError(ValueError):
     pass
 
 
-def _substitute_handles(text: str) -> str:
+def eval_source(text: str) -> str:
+    """Source for ``eval``/``exec``: ``@3`` becomes ``__exposure_h__(3)``."""
+    return _substitute_handles(text, lambda n: f"__exposure_h__({n})")
+
+
+def _substitute_handles(text: str, make=None) -> str:
     """Turn ``@3`` into a placeholder name, outside string literals only."""
+    make = make or (lambda n: _PLACEHOLDER + n)
     lines = text.splitlines(keepends=True)
     starts = [0]
     for line in lines:
@@ -57,7 +63,7 @@ def _substitute_handles(text: str) -> str:
         i = m.start()
         if any(a <= i < b for a, b in string_spans):
             return m.group(0)
-        return _PLACEHOLDER + m.group(1)
+        return make(m.group(1))
 
     return re.sub(r"@(\d+)", outside_strings, text)
 

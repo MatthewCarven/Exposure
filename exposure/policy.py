@@ -10,6 +10,9 @@
     "app.workers"           = { read = true, call = ["restart"] }
     "<entry>:self.patch"    = { read = true }
 
+``[safety]`` holds ``deny`` (patterns refused as call targets) and ``eval``
+(allow eval/exec outside the reachable scope).
+
 A key is ``module:attr.path``. ``<entry>`` as the module means "the entry
 frame's locals". Without a colon, the longest dotted prefix that is an
 already-imported module is the module (nothing is ever imported to resolve a
@@ -56,6 +59,7 @@ class Policy:
     agent: dict = field(default_factory=dict)
     actions: dict = field(default_factory=dict)   # name -> {"call": path, "on": ...}
     presets: dict = field(default_factory=dict)   # name -> {"watch": [...], "tweak": [...]}
+    safety: dict = field(default_factory=dict)    # {"deny": [patterns], "eval": bool}
 
 
 def _perm(value, key, what):
@@ -149,9 +153,27 @@ def parse(data: dict, path: str | None = None) -> Policy:
                 raise PolicyError(f"[presets.{name}] step must map paths to numbers")
             preset["step"] = dict(steps)
         presets[name] = preset
+    safety = parse_safety(data.get("safety", {}) or {})
     return Policy(path=path, scope=scope, entry=agent.get("entry"),
                   pressure=agent.get("pressure"), rules=rules, agent=dict(agent),
-                  actions=actions, presets=presets)
+                  actions=actions, presets=presets, safety=safety)
+
+
+def parse_safety(spec) -> dict:
+    """[safety]: ``deny`` (fnmatch patterns on call targets, e.g. "os.system",
+    "subprocess.*") and ``eval`` (allow eval/exec outside the reachable scope)."""
+    if not isinstance(spec, dict):
+        raise PolicyError("[safety] must be a table")
+    unknown = set(spec) - {"deny", "eval"}
+    if unknown:
+        raise PolicyError(f"[safety]: unknown key(s) {sorted(unknown)}")
+    deny = spec.get("deny", [])
+    if not isinstance(deny, list) or not all(isinstance(x, str) for x in deny):
+        raise PolicyError("[safety] deny must be a list of patterns")
+    ev = spec.get("eval", False)
+    if not isinstance(ev, bool):
+        raise PolicyError("[safety] eval must be true or false")
+    return {"deny": list(deny), "eval": ev}
 
 
 def load(path: str) -> Policy:

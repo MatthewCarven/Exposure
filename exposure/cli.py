@@ -20,7 +20,7 @@ import json
 import sys
 
 from . import client as client_mod
-from . import exprs, paths, procs
+from . import config, exprs, paths, procs
 
 ATTACH_OPTS = ("entry", "policy", "scope", "pressure", "duty", "wait", "read_only",
                "idle_timeout", "frame_budget_ms", "max_handles")
@@ -87,6 +87,8 @@ def build_parser():
     # M2
     s = sub.add_parser("call", parents=[parent], help="call a function or method")
     s.add_argument("expr", help='e.g. \'self._mirror_param(2, "gain", 0.1)\'')
+    s.add_argument("--no-capture", dest="capture", action="store_false",
+                   help="let print() output go to the program's own stdout")
     _run_opts(s)
     s = sub.add_parser("set", parents=[parent], help="set a variable, attribute or item")
     s.add_argument("target", help="path, e.g. config.debug or @3[0], or 'path = value'")
@@ -144,6 +146,18 @@ def build_parser():
     s.add_argument("expr")
     s.add_argument("--count", type=int, help="stop after N calls")
     s.add_argument("--on")
+    # M4
+    for name, hlp in (("eval", "evaluate a Python expression in the target"),
+                      ("exec", "run Python statements in the target")):
+        s = sub.add_parser(name, parents=[parent], help=hlp)
+        s.add_argument("source", help="Python source; @3 stands for handle 3")
+        s.add_argument("--frame", help="run in this frame's namespace (e.g. main, or @N); "
+                                       "default: the session's scratch namespace")
+        s.add_argument("--yes", "-y", action="store_true", help="don't ask for confirmation")
+        s.add_argument("--no-capture", dest="capture", action="store_false",
+                       help="let print() output go to the program's own stdout")
+        _run_opts(s)
+    sub.add_parser("shell", parents=[parent], help="interactive session (REPL)")
     sub.add_parser("repeats", parents=[parent], help="list repeated calls")
     s = sub.add_parser("stop", parents=[parent], help="stop a repeated call (or all)")
     s.add_argument("repeat", nargs="?", default="all")
@@ -197,6 +211,18 @@ def print_ls(res):
         print(f"... {res['total'] - nxt} more (use --offset {nxt})")
 
 
+def _confirm(question) -> bool:
+    if not sys.stdin.isatty():
+        print("exposure: eval/exec needs confirmation; pass --yes when not at a terminal",
+              file=sys.stderr)
+        return False
+    try:
+        return input(f"{question}  [y/N] ").strip().lower() in ("y", "yes")
+    except EOFError:
+        print(file=sys.stderr)
+        return False
+
+
 def _panel(c, args):
     from . import tui
     watch, tweak, steps, rate = list(getattr(args, "paths", []) or []), [], {}, None
@@ -236,6 +262,12 @@ def print_job(res):
         print(f"  -> {r.get('handle', '')} {r['preview']}".replace("->  ", "-> "))
     if "new" in res:
         print(f"  {res['old']}  ->  {res['new']}   (change {res['change']}; `undo` reverts)")
+    if res.get("output"):
+        more = " (truncated)" if res.get("output_truncated") else ""
+        print(f"  output{more}:")
+        print("    " + res["output"].rstrip("\n").replace("\n", "\n    "))
+    for w in res.get("warnings", ()):
+        print(f"  warning: {w}")
     if "error" in res:
         print(f"  raised {res['error']}  {res['exception'].get('handle', '')}")
         if res.get("traceback"):
@@ -323,6 +355,9 @@ def main(argv=None) -> int:
                 print_result("sessions", res)
             return 0
         opts = {k: getattr(args, k) for k in ATTACH_OPTS if getattr(args, k, None) is not None}
+        cfg = config.load()
+        if cfg["safety"].get("deny"):
+            opts["deny"] = cfg["safety"]["deny"]
         c = client_mod.Client.attach(args.pid, **opts)
         info = c.attach_info
         if not info.get("reused"):
@@ -350,7 +385,21 @@ def main(argv=None) -> int:
             elif args.cmd == "detach":
                 res = c.detach()
             elif args.cmd == "call":
-                res = c.call(args.expr, on=args.on, timeout=args.timeout)
+                res = c.call(args.expr, on=args.on, timeout=args.timeout,
+                             capture=None if args.capture else False)
+            elif args.cmd in ("eval", "exec"):
+                if not args.yes and cfg["client"]["confirm"]:
+                    if not _confirm(f"run in pid {c.pid}: {args.source!r}"):
+                        print("not run", file=sys.stderr)
+                        return 1
+                res = c.eval(args.source, mode=args.cmd, frame=args.frame, on=args.on,
+                             timeout=args.timeout, capture=None if args.capture else False,
+                             confirmed=True)
+                args.cmd = "call"   # print like a job
+            elif args.cmd == "shell":
+                from . import repl
+                repl.run(c)
+                return 0
             elif args.cmd == "set":
                 if args.value is None:
                     res = c.assign(args.target, on=args.on, timeout=args.timeout)

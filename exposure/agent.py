@@ -31,6 +31,12 @@ import types
 
 import ast
 import collections
+import contextvars
+import fnmatch
+import inspect as _inspect
+import io
+import itertools
+import linecache
 
 from . import executor as executor_mod
 from . import inspector, paths, policy as policy_mod, protocol
@@ -228,9 +234,18 @@ class Agent:
         self.pauser = None
         self.repeats = {}
         self._repeat_ids = 0
+        self._captures = {}           # job id -> _Capture, read by _job_report
+        self._captures_order = []
+        self._capture_seq = itertools.count(1)
+        self._routers = []            # (stream name, _Router) we installed
+        self.scratch = {"__builtins__": __builtins__, "__name__": "__exposure__"}
+        self._eval_seq = 0
         self.policy = None
         self.policy_error = None
         self._load_policy()
+        safety = (self.policy.safety if self.policy else {}) or {}
+        self.deny = list(safety.get("deny", [])) + list(config.get("deny") or [])
+        self.policy_allows_eval = safety.get("eval") is True
         self.scope = (config.get("scope") or (self.policy.scope if self.policy else None)
                       or ("both" if self._has_explicit() else "reachable"))
         if self.scope not in policy_mod.SCOPES:
@@ -276,6 +291,13 @@ class Agent:
         if self._cleaned:
             return
         self._cleaned = True
+        for name, router in self._routers:      # put sys.stdout/stderr back
+            try:
+                if getattr(sys, name) is router:
+                    setattr(sys, name, router.orig)
+            except BaseException:
+                pass
+        self._routers = []
         for r in list(self.repeats.values()):   # stop repeated calls
             r["stop"].set()
         if self.pauser is not None:              # never leave the program frozen
@@ -932,8 +954,23 @@ class Agent:
             tid, _top = self._find_thread(on.split(":", 1)[1])
             if tid == threading.main_thread().ident:
                 return self._main_executor()
-            return self._line_executor(tid)
-        raise ValueError(f"--on must be main, agent or thread:NAME, not {on!r}")
+            return self._thread_executor(tid)
+        if on == "loop":
+            for tid, frames in self._all_stacks():
+                if frames and executor_mod.running_asyncio_loop(frames[-1]) is not None:
+                    if tid == threading.main_thread().ident:
+                        return self._main_executor()
+                    return self._thread_executor(tid)
+            raise LookupError("no running asyncio event loop found on any thread")
+        raise ValueError(f"--on must be main, agent, loop or thread:NAME, not {on!r}")
+
+    def _thread_executor(self, tid):
+        """A named thread: its asyncio loop if it runs one, else its next line."""
+        ex = self.executors.get(("thread", tid))
+        if ex is None:
+            ex = executor_mod.ThreadExecutor(tid, budget_s=self.frame_budget_s)
+            self.executors[("thread", tid)] = ex
+        return ex
 
     def _frame_executor(self, frame):
         """Executor that runs on the thread owning ``frame``, while it is alive."""
@@ -997,6 +1034,12 @@ class Agent:
     # -- jobs -------------------------------------------------------------------------------
     def _run(self, fn, label, ex, timeout):
         job = executor_mod.Job(fn, label, getattr(ex, "mode", None) or "agent")
+        job.awaiter = self._await_anywhere     # an asyncio executor swaps in its own
+        cap = getattr(fn, "_capture", None)
+        if cap is not None:
+            self._captures[job.id] = cap[1]
+            del self._captures_order[:-500]
+            self._captures_order.append(job.id)
         self.jobs.add(job)
         ex.submit(job)
         job.done.wait(float(timeout) if timeout is not None else 10.0)
@@ -1011,6 +1054,15 @@ class Agent:
             return out
         out["thread"] = job.thread
         out["blocked_ms"] = job.blocked_ms
+        if job.awaited:
+            out["awaited"] = True
+        cap = self._captures.pop(job.id, None) if job.done.is_set() else None
+        if cap is not None:
+            text, truncated = cap.text()
+            if text:
+                out["output"] = text
+                if truncated:
+                    out["output_truncated"] = True
         if job.ok:
             value = job.result
             if isinstance(value, _SetResult):
@@ -1045,9 +1097,10 @@ class Agent:
             member = None
         return parent, perm, last, member
 
-    def cmd_call(self, target, args=None, kwargs=None, on=None, timeout=10.0):
+    def cmd_call(self, target, args=None, kwargs=None, on=None, timeout=10.0, capture=True):
         fn = self._prepare_call(target, args, kwargs)
-        job = self._run(fn, f"call {target}", self._executor(on), timeout)
+        job = self._run(self._capturing(fn, capture), f"call {target}", self._executor(on),
+                        timeout)
         result_perm = dict(READ_ONLY) if self.scope == "explicit" else None
         return self._job_report(job, result_perm)
 
@@ -1061,6 +1114,7 @@ class Agent:
                                       "for calls")
         else:
             self._check_change("call", parent, perm, str(seg[1]), member)
+        self._check_deny(target, member)
         a = [self._value(x) for x in (args or [])]
         kw = {str(k): self._value(v) for k, v in (kwargs or {}).items()}
         sys.audit("exposure.call", target)
@@ -1526,6 +1580,265 @@ class Agent:
     # -- presets ------------------------------------------------------------------------------
     def cmd_presets(self):
         return self.policy.presets if self.policy else {}
+
+
+    # =====================================================================================
+    # M4: eval / exec, output capture, asyncio awaiting, deny list, completion
+    # =====================================================================================
+
+    MAX_OUTPUT = 64 * 1024
+
+    def _install_routers(self):
+        if self._routers:
+            return
+        for name in ("stdout", "stderr"):
+            current = getattr(sys, name)
+            router = _Router(current)
+            setattr(sys, name, router)
+            self._routers.append((name, router))
+
+    def _capturing(self, fn, capture):
+        """Wrap ``fn`` so stdout/stderr it writes on the executing thread (or in
+        tasks it starts) are captured; other threads' output passes through."""
+        if not capture:
+            return fn
+        self._install_routers()
+        cap = _Capture(self.MAX_OUTPUT)
+        key = next(self._capture_seq)
+
+        def run():
+            token = _CAPTURE.set(cap)
+            try:
+                return fn()
+            finally:
+                _CAPTURE.reset(token)
+
+        run._capture = (key, cap)
+        return run
+
+    def _await_anywhere(self, job, awaitable):
+        """A call returned a coroutine: run it on a running asyncio loop, if any."""
+        import asyncio
+        for _tid, frames in self._all_stacks():
+            if not frames:
+                continue
+            loop = executor_mod.running_asyncio_loop(frames[-1])
+            if loop is not None:
+                fut = asyncio.run_coroutine_threadsafe(awaitable, loop)
+                fut.add_done_callback(job.finish_future)
+                return True
+        return False   # no loop: the coroutine object itself is the result
+
+    def _check_deny(self, target, member=None):
+        if not self.deny:
+            return
+        names = {str(target)}
+        obj = member
+        if isinstance(obj, types.MethodType):
+            obj = obj.__func__
+        mod = getattr(obj, "__module__", None)
+        qual = getattr(obj, "__qualname__", None)
+        if mod and qual:
+            names.add(f"{mod}.{qual}")
+        for pat in self.deny:
+            for n in names:
+                if fnmatch.fnmatchcase(n, pat):
+                    raise PermissionError(f"{target!r} matches the deny list ({pat!r}); "
+                                          "see [safety] deny in exposure.toml")
+
+    def _eval_warnings(self, source):
+        hits = []
+        for pat in self.deny:
+            word = pat.rstrip("*").rstrip(".").rsplit(".", 1)[-1]
+            if word and word in source:
+                hits.append(pat)
+        return [f"source mentions {p!r} from the deny list; eval can't be sandboxed, so "
+                "this is a warning only" for p in hits]
+
+    def cmd_eval(self, source, mode="auto", frame=None, on=None, timeout=10.0,
+                 confirmed=False, capture=True):
+        """Run Python in the target. ``mode``: eval, exec or auto (eval if it
+        parses as an expression). Namespace: a frame's (``frame`` = a path to a
+        frame, e.g. the entry function's name or @N), else the session's
+        scratch namespace, which can also read the entry frame's locals and
+        globals. ``_`` is the last eval result."""
+        self._check_writable()
+        if not confirmed:
+            raise PermissionError("eval/exec must be confirmed (the client asks first; "
+                                  "`--yes` or `confirm off` in the shell skips the question)")
+        if self.scope != "reachable" and not self.policy_allows_eval:
+            raise PermissionError(f"{self.scope} scope: eval/exec is off unless the policy "
+                                  "sets [safety] eval = true")
+        if mode == "auto":
+            try:
+                compile(source, "<probe>", "eval")
+                mode = "eval"
+            except SyntaxError:
+                mode = "exec"
+        if mode not in ("eval", "exec"):
+            raise ValueError("mode must be eval, exec or auto")
+        self._eval_seq += 1
+        fname = f"<exposure-eval-{self._eval_seq}>"
+        code = compile(source, fname, mode)
+        linecache.cache[fname] = (len(source), None, source.splitlines(True) or ["\n"], fname)
+        extras = {"__exposure_h__": lambda n: self.handles.get(int(n))[0]}
+        frame_obj = None
+        if frame:
+            frame_obj, _perm = self._resolve(frame)
+            if not isinstance(frame_obj, types.FrameType):
+                raise TypeError(f"{frame} is a {inspector.type_name(frame_obj)}, not a frame")
+            if not self._frame_alive(frame_obj):
+                raise LookupError("frame has exited")
+            g = frame_obj.f_globals
+            ns = collections.ChainMap(frame_obj.f_locals, extras)
+        else:
+            g = self.scratch
+            maps = [self.scratch]
+            try:
+                entry = self._entry_frame()
+                maps += [entry.f_locals, entry.f_globals]
+            except LookupError:
+                pass
+            ns = collections.ChainMap(*maps, extras)
+        sys.audit("exposure.eval", source)
+
+        def fn():
+            if mode == "eval":
+                value = eval(code, g, ns)
+                self.scratch["_"] = value
+                return value
+            exec(code, g, ns)
+            return None
+
+        if frame_obj is not None and on is None:
+            ex = self._frame_executor(frame_obj)
+        else:
+            ex = self._executor(on)
+        wrapped = self._capturing(fn, capture)
+        job = self._run(wrapped, f"{mode} {fname}", ex, timeout)
+        rep = self._job_report(job)
+        rep["mode"] = mode
+        rep["namespace"] = f"frame {frame}" if frame else "scratch"
+        warnings = self._eval_warnings(source)
+        if warnings:
+            rep["warnings"] = warnings
+        return rep
+
+    def cmd_scratch(self, clear=False):
+        if clear:
+            self.scratch.clear()
+            self.scratch.update({"__builtins__": __builtins__, "__name__": "__exposure__"})
+        return sorted(k for k in self.scratch if not k.startswith("__"))
+
+    def cmd_complete(self, text, limit=200):
+        """Completions for a partial path (read-only, for the shell's Tab)."""
+        text = text or ""
+        base, dot, prefix = text.rpartition(".")
+        names = []
+        if not dot:
+            explicit = self._explicit_items()
+            if self.scope != "explicit":
+                try:
+                    frame = self._entry_frame()
+                    names += list(inspector.frame_locals(frame))
+                    names += [n for n in frame.f_globals if not paths.is_dunder(n)]
+                except LookupError:
+                    pass
+            names += list(explicit)
+            names += [f"@{n}" for n in list(self.handles._by_n)[-200:]]
+            names += [k for k in self.scratch if not k.startswith("__")]
+            prefix = text
+            out = sorted({n for n in names if n.startswith(prefix)})
+        else:
+            try:
+                obj, _perm = self._resolve(base)
+            except Exception:
+                return []
+            for label, seg, _kind, _value in inspector.children(obj, self.budget.tick):
+                if seg is not None and seg[0] == "attr" and str(seg[1]).startswith(prefix):
+                    names.append(f"{base}.{seg[1]}")
+            if not isinstance(obj, (type, types.ModuleType, types.FrameType)):
+                for klass in type(obj).__mro__:          # methods and class attributes
+                    if klass is object:
+                        continue
+                    for k in type.__dict__["__dict__"].__get__(klass):
+                        if not paths.is_dunder(k) and k.startswith(prefix):
+                            names.append(f"{base}.{k}")
+            out = sorted(set(names))
+        return out[:int(limit)]
+
+
+_CAPTURE = contextvars.ContextVar("exposure_capture", default=None)
+
+
+class _Capture:
+    def __init__(self, cap):
+        self.cap = cap
+        self.parts = []
+        self.size = 0
+        self.truncated = False
+
+    def write(self, s):
+        if self.size < self.cap:
+            room = self.cap - self.size
+            self.parts.append(s[:room])
+            self.size += min(len(s), room)
+            if len(s) > room:
+                self.truncated = True
+        else:
+            self.truncated = True
+
+    def text(self):
+        return "".join(self.parts), self.truncated
+
+
+class _Router(io.TextIOBase):
+    """Stands in for sys.stdout/stderr while an Exposure session is attached:
+    writes go to the capture buffer of the current context (the thread or
+    task running an Exposure job), everything else to the original stream."""
+
+    def __init__(self, orig):
+        super().__init__()
+        self.orig = orig
+
+    def write(self, s):
+        cap = _CAPTURE.get()
+        if cap is not None:
+            cap.write(str(s))
+            return len(s)
+        if self.orig is None:
+            return len(s)
+        return self.orig.write(s)
+
+    def flush(self):
+        if _CAPTURE.get() is None and self.orig is not None:
+            try:
+                self.orig.flush()
+            except Exception:
+                pass
+
+    def writable(self):
+        return True
+
+    def isatty(self):
+        try:
+            return self.orig.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self.orig.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self.orig, "encoding", "utf-8")
+
+    @property
+    def buffer(self):
+        return getattr(self.orig, "buffer", None)
+
+    def __getattr__(self, name):
+        return getattr(self.orig, name)
 
 
 class _SetResult:

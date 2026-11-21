@@ -169,7 +169,7 @@ class Client:
     @classmethod
     def attach(cls, pid: int, *, entry=None, policy=None, scope=None, pressure=None,
                duty=None, read_only=None, idle_timeout=None, frame_budget_ms=None,
-               max_handles=None, wait=10.0, follow_launcher=True,
+               max_handles=None, deny=None, wait=10.0, follow_launcher=True,
                reuse=True) -> "Client":
         if sys.version_info < (3, 14):
             raise AttachError("attaching needs Python 3.14+ on the client side")
@@ -243,15 +243,21 @@ class Client:
             config["frame_budget_ms"] = float(frame_budget_ms)
         if max_handles:
             config["max_handles"] = int(max_handles)
+        if deny:
+            config["deny"] = list(deny)
         protocol.write_private(boot, BOOTSTRAP.format(root=PACKAGE_ROOT,
                                                       config=json.dumps(config)))
         t0 = time.perf_counter()
         try:
             sys.remote_exec(pid, boot)
-        except PermissionError as exc:
-            raise AttachError(f"not permitted to attach to {pid}: {exc} "
-                              "(same user? elevated target? on Linux check ptrace_scope)") from None
         except (OSError, RuntimeError) as exc:
+            try:   # nothing was queued in the target, so the boot file is ours to drop
+                os.remove(boot)
+            except OSError:
+                pass
+            if isinstance(exc, PermissionError):
+                raise AttachError(f"not permitted to attach to {pid}: {exc} (same user? "
+                                  "elevated target? on Linux check ptrace_scope)") from None
             raise AttachError(f"sys.remote_exec failed for {pid}: {exc} (remote debugging "
                               "may be disabled in the target, or it isn't Python 3.14+)") from None
         # The boot file is left in place on every path: the stub deletes it
@@ -308,11 +314,24 @@ class Client:
         return self.request("release", handles=handles)
 
     # -- M2: calls and sets -----------------------------------------------------------
-    def call(self, expr: str, *, on=None, timeout=None):
+    def call(self, expr: str, *, on=None, timeout=None, capture=None):
         """``c.call('self._mirror_param(2, "gain", 0.1)')``"""
         target, args, kwargs = exprs.parse_call(expr)
         return self.request("call", target=target, args=args, kwargs=kwargs, on=on,
-                            timeout=timeout)
+                            timeout=timeout, capture=capture)
+
+    # -- M4 ------------------------------------------------------------------------------
+    def eval(self, source: str, *, mode="auto", frame=None, on=None, timeout=None,
+             capture=None, confirmed=False):
+        """Run Python in the target (``confirmed`` must be True: ask the user first)."""
+        return self.request("eval", source=exprs.eval_source(source), mode=mode, frame=frame,
+                            on=on, timeout=timeout, capture=capture, confirmed=confirmed)
+
+    def scratch(self, clear=False):
+        return self.request("scratch", clear=clear)
+
+    def complete(self, text):
+        return self.request("complete", text=text)
 
     def set(self, target: str, value: str, *, on=None, timeout=None):
         """``c.set("config.debug", "True")``: value is literal or path source."""
