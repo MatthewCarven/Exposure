@@ -28,7 +28,8 @@ except ImportError:  # pragma: no cover - depends on the platform
     readline = None
 
 HELP = """\
-Browse:   ls [PATH]  show PATH  threads  stack [THREAD]  scope  ping  find type:X|name:pat
+Browse:   ls [PATH] [GLOB]  show PATH  ?PATH (signature, doc)  src PATH  threads  stack
+          scope  ping  find type:X|name:pat
 Change:   call EXPR  set PATH VALUE | set PATH = VALUE  nudge PATH DELTA  undo [N]  history
 Jobs:     jobs  result N  every INTERVAL EXPR  repeats  stop [ID|all]
 Loop:     pause [S]  step [N]  resume  frames [N]  executors
@@ -135,6 +136,8 @@ class Shell(cmd.Cmd):
     def default(self, line):
         if line.startswith("!"):
             return self._python(line[1:], "auto")
+        if line.startswith("?"):
+            return self.do_doc(line[1:])
         first = line.split()[0].lower()
         if "-m exposure" in line or first.endswith(("python", "python.exe")):
             self.stdout.write("that's a PowerShell command, and you're already in the exposure "
@@ -145,7 +148,17 @@ class Shell(cmd.Cmd):
                           "`!expr` runs Python\n")
 
     def do_help(self, arg):
+        if arg.strip():
+            return self.do_doc(arg)           # `help thing` = `?thing`
         self.stdout.write(HELP + "\n")
+
+    def do_doc(self, arg):
+        self._show("doc", self.c.doc(arg.strip()))
+
+    do_sig = do_doc
+
+    def do_src(self, arg):
+        self._show("src", self.c.src(arg.strip()))
 
     # -- Python -------------------------------------------------------------------------------
     def _ask(self, source):
@@ -168,7 +181,7 @@ class Shell(cmd.Cmd):
             self.stdout.write("not run\n")
             return False
         res = self.c.eval(source, mode=mode, frame=self.frame, confirmed=True)
-        self._emit(cli.print_job, res)
+        self._emit(cli.print_job, res, True)        # like the REPL: no "-> None"
         return False
 
     def do_eval(self, arg):
@@ -210,7 +223,10 @@ class Shell(cmd.Cmd):
 
     # -- browsing ------------------------------------------------------------------------------
     def do_ls(self, arg):
-        self._show("ls", self.c.ls(arg.strip() or None))
+        parts = arg.split()
+        target, pattern = cli.split_ls_args(parts[0] if parts else None,
+                                            parts[1] if len(parts) > 1 else None)
+        self._show("ls", self.c.ls(target, pattern=pattern))
 
     def do_show(self, arg):
         self._show("show", self.c.show(arg.strip()))
@@ -234,6 +250,9 @@ class Shell(cmd.Cmd):
             i = parts.index("--via")
             via = parts[i + 1]
             del parts[i:i + 2]
+        if via == "gc" and not self._heavy_ok("find --via gc scans the whole heap in one long "
+                                              "C call"):
+            return
         self._show("find", self.c.find(parts[0], via=via))
 
     # -- changes --------------------------------------------------------------------------------
@@ -333,7 +352,40 @@ class Shell(cmd.Cmd):
         self.stdout.write("\n")
         return True
 
+    def _heavy_ok(self, what):
+        """Warn once per session before heavy work on a real-time target (one with
+        a pressure probe, e.g. PySynthRack's xrun counter)."""
+        if getattr(self, "_heavy_warned", False):
+            return True
+        try:
+            realtime = self.c.ping()["budget"]["probe"]
+        except Exception:
+            realtime = False
+        if not realtime:
+            return True
+        self._heavy_warned = True
+        self.stdout.write(f"warning: {what}; this target has a pressure probe (audio?), so "
+                          "it may cause a dropout.\n")
+        if not self.use_rawinput:
+            return True
+        try:
+            return input("go ahead? [y/N] ").strip().lower() in ("y", "yes")
+        except EOFError:
+            return False
+
     # -- completion ------------------------------------------------------------------------------
+    def complete_do(self, text, line, begidx, endidx):
+        try:
+            return [a for a in self.c.scope().get("actions", []) if a.startswith(text)]
+        except Exception:
+            return []
+
+    def complete_preset(self, text, line, begidx, endidx):
+        try:
+            return [p for p in self.c.presets() if p.startswith(text)]
+        except Exception:
+            return []
+
     def completedefault(self, text, line, begidx, endidx):
         try:
             return self.c.complete(text)

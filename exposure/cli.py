@@ -25,7 +25,7 @@ from . import client as client_mod
 from . import config, exprs, paths, procs
 
 ATTACH_OPTS = ("entry", "policy", "scope", "pressure", "duty", "wait", "read_only",
-               "idle_timeout", "frame_budget_ms", "max_handles")
+               "idle_timeout", "frame_budget_ms", "max_handles", "drop_grace")
 
 
 def _attach_parent():
@@ -48,6 +48,9 @@ def _attach_parent():
                         "(default 1800; 0 = never)")
     g.add_argument("--frame-budget", type=float, dest="frame_budget_ms",
                    help="ms of queued work per main-loop iteration (default 2)")
+    g.add_argument("--drop-grace", type=float, dest="drop_grace",
+                   help="seconds before the agent tidies up after a client vanishes "
+                        "without saying bye (default 60)")
     g.add_argument("--max-handles", type=int, dest="max_handles",
                    help="handle table size before the least recently used are evicted "
                         "(default 10000)")
@@ -78,9 +81,14 @@ def build_parser():
     s.add_argument("--limit", type=int)
     s = sub.add_parser("ls", parents=[parent])
     s.add_argument("target", nargs="?")
+    s.add_argument("pattern", nargs="?", help="only names matching this glob, e.g. '*widget*'")
     s.add_argument("--limit", type=int)
     s.add_argument("--offset", type=int)
     s = sub.add_parser("show", parents=[parent])
+    s.add_argument("target")
+    s = sub.add_parser("doc", parents=[parent], help="signature, docstring, where defined")
+    s.add_argument("target")
+    s = sub.add_parser("src", parents=[parent], help="source code of a function or class")
     s.add_argument("target")
     sub.add_parser("scope", parents=[parent])
     s = sub.add_parser("release", parents=[parent])
@@ -261,6 +269,38 @@ def print_ls(res):
         print(f"... {res['total'] - nxt} more (use --offset {nxt})")
 
 
+def split_ls_args(target, pattern):
+    """`ls TARGET PATTERN`; a lone glob (`ls '*speed*'`) filters the roots."""
+    if (pattern is None and target and any(ch in target for ch in "*?")
+            and not target.startswith("@")):
+        return None, target
+    return target, pattern
+
+
+def print_doc(res):
+    _line(f"{res['target']}  {res['preview']}" + (f"  ({res['about']})" if res.get("about")
+                                                   else ""))
+    if res.get("signature"):
+        _line(f"  {res['signature']}")
+    if res.get("defined"):
+        _line(f"  defined at {_short_path(res['defined'], 4)}")
+    if res.get("doc"):
+        print()
+        for ln in res["doc"].splitlines():
+            _line(f"  {ln}")
+        if res.get("doc_lines", 0) > len(res["doc"].splitlines()):
+            _line(f"  ... ({res['doc_lines']} lines in all)")
+
+
+def print_src(res):
+    _line(f"{_short_path(res['file'], 4)}:{res['start']}")
+    width = len(str(res["start"] + len(res["lines"])))
+    for i, ln in enumerate(res["lines"]):
+        _line(f"{res['start'] + i:>{width}}  {ln}")
+    if res.get("truncated"):
+        print("  ... (truncated)")
+
+
 def _confirm(question) -> bool:
     if not sys.stdin.isatty():
         print("exposure: eval/exec needs confirmation; pass --yes when not at a terminal",
@@ -302,12 +342,13 @@ def _panel(c, args):
     return 0
 
 
-def print_job(res):
+def print_job(res, hide_none=False):
     head = f"job {res['job']} {res['state']}"
     if res.get("thread"):
         head += f" on {res['thread']} ({res['on']}), blocked {res['blocked_ms']} ms"
     print(head)
-    if "result" in res:
+    if "result" in res and not (hide_none and res["result"].get("preview") == "None"
+                                and "handle" not in res["result"]):
         r = res["result"]
         _line(f"  -> {r.get('handle', '')} {r['preview']}".replace("->  ", "-> "))
     if "new" in res:
@@ -342,6 +383,10 @@ def print_result(cmd, res):
                 for p in res], ["pid", "python", "attachable", "name", "exe"])
     elif cmd in ("call", "set", "do", "result", "nudge"):
         print_job(res)
+    elif cmd == "doc":
+        print_doc(res)
+    elif cmd == "src":
+        print_src(res)
     elif cmd == "find":
         _line(f"{res['query']} via {res['via']}: {len(res['results'])} found, "
               f"{res['scanned']} objects scanned in {res['ms']} ms"
@@ -425,7 +470,12 @@ def main(argv=None) -> int:
             elif args.cmd == "stack":
                 res = c.stack(args.thread, args.limit)
             elif args.cmd == "ls":
-                res = c.ls(args.target, args.limit, args.offset)
+                target, pattern = split_ls_args(args.target, args.pattern)
+                res = c.ls(target, args.limit, args.offset, pattern)
+            elif args.cmd == "doc":
+                res = c.doc(args.target)
+            elif args.cmd == "src":
+                res = c.src(args.target)
             elif args.cmd == "show":
                 res = c.show(args.target)
             elif args.cmd == "scope":

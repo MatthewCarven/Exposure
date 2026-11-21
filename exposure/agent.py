@@ -227,6 +227,10 @@ class Agent:
         default_idle = 0 if self.served else 1800
         self.idle_timeout = float(config.get("idle_timeout", default_idle))  # 0 = never
         self.audit_path = config.get("audit_log")
+        # a client that disappears without a "bye" (killed shell, crashed
+        # script) gets this long before the agent tidies up and detaches
+        self.drop_grace = float(config.get("drop_grace", 60))
+        self._drop_deadline = None
         self.frame_budget_s = float(config.get("frame_budget_ms", 2.0)) / 1000.0
         self.last_activity = time.time()
         self.executors = {}           # key -> ThreadExecutor
@@ -398,10 +402,14 @@ class Agent:
                 try:
                     conn, _addr = self.sock.accept()
                 except socket.timeout:
-                    if (self.idle_timeout and time.time() - self.last_activity > self.idle_timeout
-                            and not self.jobs.pending() and not self._open_conns):
+                    now = time.time()
+                    quiet = not self.jobs.pending() and not self._open_conns
+                    if quiet and self.idle_timeout and now - self.last_activity > self.idle_timeout:
                         self.idle_detached = True
                         break   # abandoned session: tidy up as if detached
+                    if quiet and self._drop_deadline and now > self._drop_deadline:
+                        self.idle_detached = True
+                        break   # the last client vanished without a bye
                     continue
                 except OSError:
                     break
@@ -420,6 +428,7 @@ class Agent:
         with self._state_lock:
             self._open_conns += 1
             self._conns.add(conn)
+            self._drop_deadline = None        # someone's here again
         try:
             self._handle_conn(conn)
         except BaseException:
@@ -452,6 +461,12 @@ class Agent:
             try:
                 req = protocol.recv_msg(conn)
             except (ConnectionError, OSError, ValueError):
+                # gone without saying bye: a killed shell or client. Tidy up
+                # after a short grace period unless someone reconnects.
+                if self.drop_grace and not self.served:
+                    self._drop_deadline = time.time() + self.drop_grace
+                return
+            if isinstance(req, dict) and req.get("cmd") == "bye":
                 return
             if rest:
                 time.sleep(rest)
@@ -870,10 +885,16 @@ class Agent:
             self.budget.tick()
         return {"thread": tid, "frames": out}
 
-    def cmd_ls(self, target=None, limit=DEFAULT_LIMIT, offset=0):
+    def cmd_ls(self, target=None, limit=DEFAULT_LIMIT, offset=0, pattern=None):
         limit = max(1, min(int(limit), MAX_LIMIT))
         offset = max(0, int(offset))
         explicit = self._explicit_items()
+        if pattern:
+            res = self.cmd_ls(target, MAX_LIMIT, 0)       # filter, then page
+            keep = [e for e in res["entries"] if fnmatch.fnmatch(str(e["name"]), pattern)]
+            res.update(entries=keep[offset:offset + limit], total=len(keep), offset=offset,
+                       more=offset + limit < len(keep), pattern=pattern)
+            return res
         if target in (None, ""):
             return self._ls_roots(explicit, limit, offset)
         obj, perm = self._resolve(target)
@@ -1875,6 +1896,63 @@ class Agent:
         if warnings:
             rep["warnings"] = warnings
         return rep
+
+    def _doc_target(self, target):
+        obj, _perm = self._resolve(target)
+        if isinstance(obj, inspector.NotEvaluated):
+            d = obj.descriptor
+            obj = getattr(d, "fget", None) or d
+        if isinstance(obj, types.MethodType):
+            obj = obj.__func__
+        return obj
+
+    def cmd_doc(self, target):
+        """Signature, docstring and where it's defined (reads files, runs no
+        target code beyond inspect's attribute reads)."""
+        import inspect as _ins
+        obj = self._doc_target(target)
+        out = {"target": target, "type": inspector.type_name(obj),
+               "preview": inspector.preview(obj)}
+        subject = obj if isinstance(obj, (type, types.FunctionType, types.BuiltinFunctionType,
+                                          types.ModuleType, staticmethod, classmethod,
+                                          property)) else type(obj)
+        if subject is not obj:
+            out["about"] = f"its class {inspector.type_name(obj)}"
+        try:
+            if callable(subject) and not isinstance(subject, types.ModuleType):
+                out["signature"] = f"{getattr(subject, '__qualname__', '')}" + str(
+                    _ins.signature(subject, follow_wrapped=False))
+        except (TypeError, ValueError):
+            pass
+        doc = _ins.getdoc(subject)
+        if doc:
+            out["doc"] = doc.split("\n\n", 1)[0].strip()
+            out["doc_lines"] = len(doc.splitlines())
+        try:
+            f = _ins.getsourcefile(subject) or _ins.getfile(subject)
+            line = None
+            try:
+                line = _ins.getsourcelines(subject)[1]
+            except (OSError, TypeError):
+                pass
+            out["defined"] = f"{f}:{line}" if line else f
+        except (TypeError, OSError):
+            pass
+        return out
+
+    def cmd_src(self, target, limit=400):
+        import inspect as _ins
+        obj = self._doc_target(target)
+        subject = obj if isinstance(obj, (type, types.FunctionType, types.ModuleType)) \
+            else type(obj)
+        try:
+            lines, start = _ins.getsourcelines(subject)
+        except (OSError, TypeError) as exc:
+            raise LookupError(f"no source for {target}: {exc}") from None
+        f = _ins.getsourcefile(subject)
+        return {"target": target, "file": f, "start": max(1, start),
+                "lines": [ln.rstrip("\n") for ln in lines[:int(limit)]],
+                "truncated": len(lines) > int(limit)}
 
     def cmd_scratch(self, clear=False):
         if clear:

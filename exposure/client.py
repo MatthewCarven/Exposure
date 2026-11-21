@@ -192,8 +192,8 @@ class Client:
     @classmethod
     def attach(cls, pid: int, *, entry=None, policy=None, scope=None, pressure=None,
                duty=None, read_only=None, idle_timeout=None, frame_budget_ms=None,
-               max_handles=None, deny=None, wait=10.0, follow_launcher=True,
-               reuse=True) -> "Client":
+               max_handles=None, deny=None, drop_grace=None, wait=10.0,
+               follow_launcher=True, reuse=True) -> "Client":
         if sys.version_info < (3, 14):
             raise AttachError("attaching needs Python 3.14+ on the client side")
         pid = int(pid)
@@ -278,6 +278,8 @@ class Client:
             config["max_handles"] = int(max_handles)
         if deny:
             config["deny"] = list(deny)
+        if drop_grace is not None:
+            config["drop_grace"] = float(drop_grace)
         protocol.write_private(boot, BOOTSTRAP.format(root=PACKAGE_ROOT,
                                                       config=json.dumps(config)))
         t0 = time.perf_counter()
@@ -341,8 +343,14 @@ class Client:
     def stack(self, thread=None, limit=None):
         return self.request("stack", thread=thread, limit=limit)
 
-    def ls(self, target=None, limit=None, offset=None):
-        return self.request("ls", target=target, limit=limit, offset=offset)
+    def ls(self, target=None, limit=None, offset=None, pattern=None):
+        return self.request("ls", target=target, limit=limit, offset=offset, pattern=pattern)
+
+    def doc(self, target):
+        return self.request("doc", target=target)
+
+    def src(self, target):
+        return self.request("src", target=target)
 
     def show(self, target):
         return self.request("show", target=target)
@@ -450,6 +458,11 @@ class Client:
             self.close()
 
     def close(self):
+        """Say bye (so the agent knows this was a clean exit, not a crash) and close."""
+        try:
+            protocol.send_msg(self.sock, {"id": self._next_id, "cmd": "bye"})
+        except (OSError, ValueError):
+            pass
         try:
             self.sock.close()
         except OSError:

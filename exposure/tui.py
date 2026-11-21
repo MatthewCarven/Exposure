@@ -12,6 +12,7 @@ Standard library only (msvcrt on Windows, termios elsewhere).
 """
 from __future__ import annotations
 
+import collections
 import os
 import sys
 import time
@@ -101,12 +102,54 @@ class Keys:
                 "\x03": "ctrl-c"}.get(ch, ch)
 
 
-def _fmt_row(label, value, changed, selected, ansi, width=40):
+SPARKS = "▁▂▃▄▅▆▇█"
+HISTORY = 24
+
+
+def as_number(preview):
+    """The float a preview shows, or None (bools and non-numbers aren't graphed)."""
+    if preview in ("True", "False"):
+        return None
+    try:
+        return float(preview)
+    except (TypeError, ValueError):
+        return None
+
+
+ASCII_SPARKS = "_.-~=*#@"
+
+
+def _spark_chars(stream=None):
+    enc = getattr(stream or sys.stdout, "encoding", None) or "ascii"
+    try:
+        SPARKS.encode(enc)
+        return SPARKS
+    except (UnicodeEncodeError, LookupError):
+        return ASCII_SPARKS     # e.g. output redirected to a cp1252 file
+
+
+def sparkline(values, chars=None):
+    """A one-line graph of recent values (flat line when they don't change)."""
+    chars = chars or _spark_chars()
+    if not values:
+        return ""
+    lo, hi = min(values), max(values)
+    if hi == lo:
+        return chars[0] * len(values)
+    span = hi - lo
+    return "".join(chars[min(len(chars) - 1, int((v - lo) / span * len(chars)))]
+                   for v in values)
+
+
+def _fmt_row(label, value, changed, selected, ansi, width=40, history=None):
     mark = ">" if selected else " "
-    text = f"{mark} {label:<{width}} {value}"
+    extra = ""
+    if history and len(history) > 1:
+        extra = (f"  {sparkline(history):<{HISTORY}}  min {min(history):g}  "
+                 f"max {max(history):g}")
     if ansi and changed:
-        return f"{mark} {label:<{width}} {HIGHLIGHT}{value}{RESET}"
-    return text
+        return f"{mark} {label:<{width}} {HIGHLIGHT}{value}{RESET}{extra}"
+    return f"{mark} {label:<{width}} {value}{extra}"
 
 
 def run_panel(client, watch, tweak=(), *, rate=10.0, steps=None, count=None, plain=False,
@@ -118,6 +161,7 @@ def run_panel(client, watch, tweak=(), *, rate=10.0, steps=None, count=None, pla
     paths = list(dict.fromkeys([*watch, *tweak]))
     period = 1.0 / max(0.1, float(rate))
     prev = {}
+    histories = {}
     selected = 0
     typed = ""
     status = ""
@@ -148,9 +192,14 @@ def run_panel(client, watch, tweak=(), *, rate=10.0, steps=None, count=None, pla
                 value = v.get("preview", v.get("error", "?"))
                 changed = p in prev and prev[p] != value
                 prev[p] = value
+                num = as_number(value)
+                hist = histories.setdefault(p, collections.deque(maxlen=HISTORY))
+                if num is not None:
+                    hist.append(num)
                 sel = bool(tweak) and p == tweak[selected]
                 label = p + (f"  (step {steps.get(p, 1)})" if p in tweak else "")
-                rows.append(_fmt_row(label, value, changed, sel, ansi, width + 12))
+                rows.append(_fmt_row(label, value, changed, sel, ansi, width + 12,
+                                     hist if num is not None else None))
             if tweak and interactive:
                 rows.append(f"{DIM if ansi else ''}Up/Down nudge (Shift or PgUp/PgDn x10), "
                             "Tab select, type a value + Enter, u undo, p pause, s step, "
