@@ -270,8 +270,23 @@ class Agent:
         self.thread.start()
 
     def ensure_alive(self):
-        if self.thread.is_alive():
+        """Refresh the session file of a running agent. False if this agent is
+        detaching (or gone), so the caller should wait for it and start anew."""
+        if self.thread.is_alive() and not self.stop.is_set():
             self.write_session()
+            return True
+        return False
+
+    def _begin_stop(self):
+        """Stop taking clients at once: drop the session file and close the
+        listening socket, so nobody connects to an agent that's shutting down.
+        The accept loop then wakes with OSError and runs _cleanup."""
+        self.stop.set()
+        self._remove_files()
+        try:
+            self.sock.close()
+        except BaseException:
+            pass
 
     def write_session(self):
         protocol.ensure_session_dir()
@@ -281,9 +296,18 @@ class Agent:
             "protocol": protocol.PROTOCOL_VERSION}))
 
     def _remove_files(self):
-        for p in (protocol.session_path(self.pid), protocol.boot_path(self.pid)):
+        """Remove our session file, only if it's still ours (a fresh agent may
+        already have replaced it). The boot file is left alone: the stub deletes
+        it, and removing it here could drop a new attach's pending boot file."""
+        path = protocol.session_path(self.pid)
+        try:
+            with open(path, encoding="utf-8") as f:
+                ours = json.load(f).get("token") == self.token
+        except (OSError, ValueError, AttributeError):
+            ours = False
+        if ours:
             try:
-                os.remove(p)
+                os.remove(path)
             except OSError:
                 pass
 
@@ -384,6 +408,9 @@ class Agent:
                 token.encode("utf-8"), self.token.encode("utf-8")):
             protocol.send_msg(conn, {"ok": False, "error": "bad token"})
             return
+        if self.stop.is_set():
+            protocol.send_msg(conn, {"ok": False, "error": "detaching"})
+            return
         protocol.send_msg(conn, {"ok": True, "pid": self.pid, "agent": AGENT_VERSION,
                                  "protocol": protocol.PROTOCOL_VERSION})
         rest = 0.0
@@ -402,7 +429,7 @@ class Agent:
                                          "error": f"unserialisable result: {exc}"})
             rest = self.budget.end()
             if req.get("cmd") == "detach" and resp.get("ok"):
-                self.stop.set()
+                self._begin_stop()
                 return
 
     def _dispatch(self, req):
@@ -1684,7 +1711,17 @@ class Agent:
         extras = {"__exposure_h__": lambda n: self.handles.get(int(n))[0]}
         frame_obj = None
         if frame:
-            frame_obj, _perm = self._resolve(frame)
+            frame_obj = None
+            if not frame.startswith("@"):     # a running function's name: App.run, main
+                for _tid, frames in self._all_stacks():
+                    for f in reversed(frames):
+                        if self._matches(f, frame):
+                            frame_obj = f
+                            break
+                    if frame_obj is not None:
+                        break
+            if frame_obj is None:
+                frame_obj, _perm = self._resolve(frame)
             if not isinstance(frame_obj, types.FrameType):
                 raise TypeError(f"{frame} is a {inspector.type_name(frame_obj)}, not a frame")
             if not self._frame_alive(frame_obj):
@@ -1858,8 +1895,14 @@ def start(config: dict):
     with _start_lock:
         existing = getattr(sys, "_exposure_agent", None)
         if existing is not None:
-            existing.ensure_alive()
-            return existing
+            if existing.ensure_alive():
+                return existing
+            existing.thread.join(2.0)    # detaching: let its cleanup finish
+            if getattr(sys, "_exposure_agent", None) is existing:
+                try:
+                    del sys._exposure_agent
+                except BaseException:
+                    pass
         agent = Agent(config)
         sys._exposure_agent = agent
         try:

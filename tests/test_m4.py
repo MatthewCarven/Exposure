@@ -59,6 +59,7 @@ def test_eval_and_exec(make_target):
         c.eval("double = lambda x: 2 * x", confirmed=True)     # scratch persists
         assert c.eval("double(21)", confirmed=True)["result"]["preview"] == "42"
         assert "double" in c.scratch()
+        assert c.eval("frame", frame="main", confirmed=True)["result"]["preview"].isdigit()
         r = c.eval('mode = "turbo"', frame="main", confirmed=True)
         assert r["mode"] == "exec" and r["namespace"] == "frame main"
         time.sleep(0.2)
@@ -162,6 +163,20 @@ def test_complete(make_target):
         assert c.complete("nope.x") == []
 
 
+def test_reattach_loads_current_agent_code(make_target):
+    """A long-running target must not keep a previous session's agent code."""
+    t = make_target("--expose")             # the program imported exposure itself
+    with Client.attach(t.pid, scope="reachable") as c:
+        c.eval("import sys; sys.modules['exposure.agent'].AGENT_VERSION = 'stale'",
+               confirmed=True)
+        assert c.ping()["agent"] == "stale"
+        c.detach()
+    with Client.attach(t.pid) as c:
+        assert c.ping()["agent"] != "stale"
+        assert {e["name"] for e in c.ls()["entries"]} >= {"config", "items"}  # registry kept
+        assert c.scope()["scope"] == "both"
+
+
 def test_failed_remote_exec_removes_boot_file(make_target, monkeypatch):
     t = make_target()
 
@@ -192,3 +207,14 @@ def test_shell_script(make_target):
     assert "-> 150" in text                       # py mode: player.hp is 50 * 3
     assert "-> 'normal'" in text                  # frame main: the local `mode`
     assert "unknown command 'nosuch'" in text and "error:" in text
+
+
+def test_reattach_right_after_detach(make_target):
+    """A detaching agent must not take a new client: re-attaching straight after
+    a detach gets a working session every time (it used to land on the dying
+    agent about one time in three and lose the connection on the first request)."""
+    t = make_target(script="game_loop.py")
+    for _ in range(8):
+        with Client.attach(t.pid) as c:
+            assert c.ping()["pid"] == t.pid
+            c.detach()

@@ -41,11 +41,28 @@ def _exposure_boot():
     agent = getattr(sys, "_exposure_agent", None)
     if agent is not None:
         try:
-            agent.ensure_alive()
+            if agent.ensure_alive():
+                return
         except BaseException:
-            pass
-        return
+            return
     root = {root!r}
+    # A previous session's agent modules may still be cached in sys.modules;
+    # drop them so this attach runs the Exposure code on disk now. Keep the
+    # package and its registry: the program may hold exposure.expose() items.
+    for name in [m for m in list(sys.modules) if m.startswith("exposure.")]:
+        if name == "exposure.registry":
+            continue
+        mod = sys.modules.get(name)
+        f = getattr(mod, "__file__", None) or ""
+        if f.startswith(root):
+            del sys.modules[name]
+            pkg = sys.modules.get("exposure")
+            # `from exposure import agent` would take the package attribute
+            # without importing, so drop that as well
+            try:
+                delattr(pkg, name.split(".", 1)[1])
+            except (AttributeError, TypeError):
+                pass
     added = root not in sys.path
     try:
         if added:
@@ -109,6 +126,8 @@ def _connect(pid: int, timeout=2.0):
         return None, info
     if not hello.get("ok"):
         sock.close()
+        if hello.get("error") == "detaching":   # a dying agent: inject a fresh one
+            return None, info
         raise AttachError(f"agent refused the session token: {hello.get('error')}")
     return sock, hello
 
@@ -195,8 +214,15 @@ class Client:
         if reuse:
             sock, hello = _connect(pid)
             if sock is not None:
+                try:
+                    c = cls(pid, sock, hello, info)
+                    c.ping()      # an agent mid-detach may accept, then drop us
+                except (OSError, ConnectionError, ValueError):
+                    sock.close()
+                    sock = None
+                    time.sleep(0.6)   # let it finish tidying up, then inject afresh
+            if sock is not None:
                 info["reused"] = True
-                c = cls(pid, sock, hello, info)
                 asked = {"entry": entry, "scope": scope, "pressure": pressure,
                          "duty": float(duty) if duty else None,
                          "policy": os.path.abspath(policy) if policy else None,

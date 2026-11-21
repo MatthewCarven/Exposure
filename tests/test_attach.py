@@ -128,6 +128,16 @@ def test_detach_and_reattach(make_target):
         assert c2.ping()["handles"] == 0
 
 
+def test_reattach_straight_after_detach(make_target):
+    t = make_target()
+    for _ in range(5):
+        c = Client.attach(t.pid)
+        assert c.ping()["pid"] == t.pid
+        c.detach()                 # no pause before the next attach
+    with Client.attach(t.pid) as c:
+        assert len([x for x in c.threads() if x["name"] == "exposure-agent"]) == 1
+
+
 def test_stale_session_cleanup(make_target):
     t = make_target()
     Client.attach(t.pid).close()
