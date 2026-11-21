@@ -18,7 +18,7 @@ import socket
 import sys
 import time
 
-from . import procs, protocol
+from . import exprs, procs, protocol
 
 PACKAGE_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -101,7 +101,7 @@ def _connect(pid: int, timeout=2.0):
     except (OSError, KeyError, ValueError):
         return None, info
     try:
-        sock.settimeout(60)
+        sock.settimeout(300)
         protocol.send_msg(sock, {"token": info["token"]})
         hello = protocol.recv_msg(sock)
     except (OSError, ValueError, ConnectionError):
@@ -168,7 +168,9 @@ class Client:
     # -- attach ---------------------------------------------------------------------
     @classmethod
     def attach(cls, pid: int, *, entry=None, policy=None, scope=None, pressure=None,
-               duty=None, wait=10.0, follow_launcher=True, reuse=True) -> "Client":
+               duty=None, read_only=None, idle_timeout=None, frame_budget_ms=None,
+               max_handles=None, wait=10.0, follow_launcher=True,
+               reuse=True) -> "Client":
         if sys.version_info < (3, 14):
             raise AttachError("attaching needs Python 3.14+ on the client side")
         pid = int(pid)
@@ -188,7 +190,13 @@ class Client:
                 c = cls(pid, sock, hello, info)
                 asked = {"entry": entry, "scope": scope, "pressure": pressure,
                          "duty": float(duty) if duty else None,
-                         "policy": os.path.abspath(policy) if policy else None}
+                         "policy": os.path.abspath(policy) if policy else None,
+                         "read_only": True if read_only else None,
+                         "idle_timeout": float(idle_timeout) if idle_timeout is not None
+                         else None,
+                         "frame_budget_ms": float(frame_budget_ms) if frame_budget_ms
+                         else None,
+                         "max_handles": int(max_handles) if max_handles else None}
                 asked = {k: v for k, v in asked.items() if v is not None}
                 if asked:
                     running = c.ping().get("config", {})
@@ -218,6 +226,14 @@ class Client:
             config["pressure"] = pressure
         if duty:
             config["duty"] = float(duty)
+        if read_only:
+            config["read_only"] = True
+        if idle_timeout is not None:
+            config["idle_timeout"] = float(idle_timeout)
+        if frame_budget_ms:
+            config["frame_budget_ms"] = float(frame_budget_ms)
+        if max_handles:
+            config["max_handles"] = int(max_handles)
         protocol.write_private(boot, BOOTSTRAP.format(root=PACKAGE_ROOT,
                                                       config=json.dumps(config)))
         t0 = time.perf_counter()
@@ -281,6 +297,45 @@ class Client:
 
     def release(self, handles=None):
         return self.request("release", handles=handles)
+
+    # -- M2: calls and sets -----------------------------------------------------------
+    def call(self, expr: str, *, on=None, timeout=None):
+        """``c.call('self._mirror_param(2, "gain", 0.1)')``"""
+        target, args, kwargs = exprs.parse_call(expr)
+        return self.request("call", target=target, args=args, kwargs=kwargs, on=on,
+                            timeout=timeout)
+
+    def set(self, target: str, value: str, *, on=None, timeout=None):
+        """``c.set("config.debug", "True")``: value is literal or path source."""
+        return self.request("set", target=exprs.parse_target(target),
+                            value=exprs.parse_value(value), on=on, timeout=timeout)
+
+    def assign(self, statement: str, *, on=None, timeout=None):
+        """``c.assign("config.retries = 5")``"""
+        target, value = exprs.parse_assignment(statement)
+        return self.request("set", target=target, value=value, on=on, timeout=timeout)
+
+    def do(self, action: str, *values: str, on=None, timeout=None):
+        args = [exprs.parse_value(v) for v in values]
+        return self.request("do", action=action, args=args, on=on, timeout=timeout)
+
+    def undo(self, n=1):
+        return self.request("undo", n=n)
+
+    def history(self, limit=None):
+        return self.request("history", limit=limit)
+
+    def jobs(self):
+        return self.request("jobs")
+
+    def result(self, job, timeout=None):
+        return self.request("result", job=job, timeout=timeout)
+
+    def executors(self):
+        return self.request("executors")
+
+    def frames(self, n=300, timeout=None):
+        return self.request("frames", n=n, timeout=timeout)
 
     def detach(self):
         try:

@@ -29,6 +29,9 @@ import time
 import traceback
 import types
 
+import ast
+
+from . import executor as executor_mod
 from . import inspector, paths, policy as policy_mod, protocol
 
 AGENT_VERSION = "0.1.0"
@@ -132,19 +135,27 @@ class Handles:
     """``@n`` ids for objects shown to the client. Strong references while
     attached; cleared on detach or ``release``."""
 
-    def __init__(self):
+    def __init__(self, max_handles=10000):
         self._lock = threading.Lock()
         self._next = 1
-        self._by_n: dict[int, tuple] = {}     # n -> (obj, perm)
+        self._by_n: dict[int, tuple] = {}     # n -> (obj, perm), oldest first
         self._by_id: dict[int, int] = {}      # id(obj) -> n
+        self.max = max(100, int(max_handles))
+        self.evicted = 0
 
     def add(self, obj, perm=None) -> int:
         with self._lock:
             n = self._by_id.get(id(obj))
             if n is not None and self._by_n[n][0] is obj:
-                if perm is not None and self._by_n[n][1] is None:
-                    self._by_n[n] = (obj, perm)
+                entry = self._by_n.pop(n)            # re-insert: most recently used
+                self._by_n[n] = entry if perm is None or entry[1] is not None else (obj, perm)
                 return n
+            if len(self._by_n) >= self.max:          # evict the least recently used 10%
+                for old in list(self._by_n)[:max(1, self.max // 10)]:
+                    o, _p = self._by_n.pop(old)
+                    if self._by_id.get(id(o)) == old:
+                        del self._by_id[id(o)]
+                    self.evicted += 1
             n = self._next
             self._next += 1
             self._by_n[n] = (obj, perm)
@@ -154,9 +165,12 @@ class Handles:
     def get(self, n: int):
         with self._lock:
             try:
-                return self._by_n[n]
+                entry = self._by_n.pop(n)
             except KeyError:
-                raise LookupError(f"no handle @{n} (released, or from an earlier session)") from None
+                raise LookupError(f"no handle @{n} (released, evicted, or from an earlier "
+                                  "session)") from None
+            self._by_n[n] = entry
+            return entry
 
     def release(self, ns=None) -> int:
         with self._lock:
@@ -193,10 +207,20 @@ class Agent:
         self.token = secrets.token_hex(32)
         self.started = time.time()
         self.stop = threading.Event()
-        self.handles = Handles()
+        self.handles = Handles(config.get("max_handles", 10000))
         self.budget = Budget(duty=float(config.get("duty", 0.25)))
         self.requests = 0
         self.errors = 0
+        self.read_only = bool(config.get("read_only"))
+        self.idle_timeout = float(config.get("idle_timeout", 1800))  # seconds; 0 = never
+        self.frame_budget_s = float(config.get("frame_budget_ms", 2.0)) / 1000.0
+        self.last_activity = time.time()
+        self.executors = {}           # key -> ThreadExecutor
+        self.agent_exec = executor_mod.AgentExecutor()
+        self.jobs = executor_mod.Jobs()
+        self.changes = []             # undo log / history, oldest first
+        self._change_ids = 0
+        self.idle_detached = False
         self.policy = None
         self.policy_error = None
         self._load_policy()
@@ -245,10 +269,17 @@ class Agent:
         if self._cleaned:
             return
         self._cleaned = True
+        for ex in list(self.executors.values()):
+            try:
+                ex.close()
+            except BaseException:
+                pass
+        self.executors.clear()
         try:
             self.handles.release()
         except BaseException:
             pass
+        self.changes = []
         try:
             self.sock.close()
         except BaseException:
@@ -271,6 +302,10 @@ class Agent:
                 try:
                     conn, _addr = self.sock.accept()
                 except socket.timeout:
+                    if (self.idle_timeout and time.time() - self.last_activity > self.idle_timeout
+                            and not self.jobs.pending()):
+                        self.idle_detached = True
+                        break   # abandoned session: tidy up as if detached
                     continue
                 except OSError:
                     break
@@ -289,7 +324,7 @@ class Agent:
             self._cleanup()
 
     def _handle_conn(self, conn):
-        conn.settimeout(300)
+        conn.settimeout(min(300.0, self.idle_timeout) if self.idle_timeout else 300.0)
         hello = protocol.recv_msg(conn)
         token = hello.get("token") if isinstance(hello, dict) else None
         if not isinstance(token, str) or not hmac.compare_digest(
@@ -320,6 +355,7 @@ class Agent:
     def _dispatch(self, req):
         rid = req.get("id") if isinstance(req, dict) else None
         self.requests += 1
+        self.last_activity = time.time()
         self.budget.begin()
         try:
             cmd = req.get("cmd")
@@ -332,7 +368,7 @@ class Agent:
             self.errors += 1
             out = {"id": rid, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
             if not isinstance(exc, (LookupError, inspector.AccessDenied, paths.PathError,
-                                    PermissionError, TypeError)):
+                                    PermissionError, TypeError, ValueError)):
                 out["traceback"] = traceback.format_exc(limit=12)
             return out
 
@@ -606,7 +642,12 @@ class Agent:
                 "handles": len(self.handles), "budget": self.budget.stats(),
                 "config": {"entry": self.entry_spec, "scope": self.scope,
                            "pressure": self.pressure_spec, "duty": self.budget.base_duty,
-                           "policy": self.policy.path if self.policy else None},
+                           "policy": self.policy.path if self.policy else None,
+                           "read_only": self.read_only, "idle_timeout": self.idle_timeout,
+                           "frame_budget_ms": self.frame_budget_s * 1000,
+                           "max_handles": self.handles.max},
+                "handles_evicted": self.handles.evicted,
+                "jobs_pending": len(self.jobs.pending()), "changes": len(self.changes),
                 "gil": getattr(sys, "_is_gil_enabled", lambda: True)()}
 
     def cmd_threads(self):
@@ -801,7 +842,10 @@ class Agent:
                               "resolved": not isinstance(obj, Exception),
                               **({"error": str(obj)} if isinstance(obj, Exception) else {})}
                              for root, (label, obj, perm) in explicit.items()],
-                "enforced": ["read"], "parsed_not_enforced": ["write", "call"]}
+                "read_only": self.read_only,
+                "enforced": (["read"] if self.read_only else ["read", "write", "call"])
+                if self.scope != "reachable" else [],
+                "actions": sorted(self.policy.actions) if self.policy else []}
 
     def cmd_release(self, handles=None):
         if handles is None:
@@ -810,7 +854,404 @@ class Agent:
         return {"released": self.handles.release(ns)}
 
     def cmd_detach(self):
-        return {"detaching": True, "handles_released": len(self.handles)}
+        return {"detaching": True, "handles_released": len(self.handles),
+                "jobs_still_running": len(self.jobs.pending())}
+
+    # =====================================================================================
+    # M2: calls and sets
+    # =====================================================================================
+
+    def _check_writable(self):
+        if self.read_only:
+            raise PermissionError("attached with --read-only: calls and sets are refused")
+
+    # -- executors -------------------------------------------------------------------------
+    def _main_executor(self):
+        tid = threading.main_thread().ident
+        ex = self.executors.get(("main", tid))
+        if ex is None:
+            prefer = None
+            try:
+                frame = self._entry_frame()
+                prefer = frame.f_code
+            except LookupError:
+                pass
+            ex = executor_mod.ThreadExecutor(tid, budget_s=self.frame_budget_s,
+                                             prefer_code=prefer, is_main=True)
+            self.executors[("main", tid)] = ex
+        return ex
+
+    def _line_executor(self, tid):
+        ex = self.executors.get(("line", tid))
+        if ex is None:
+            ex = executor_mod.ThreadExecutor(tid, budget_s=self.frame_budget_s)
+            ex.mode = "line"
+            self.executors[("line", tid)] = ex
+        return ex
+
+    def _executor(self, on):
+        if on in (None, "", "main"):
+            return self._main_executor()
+        if on == "agent":
+            return self.agent_exec
+        if isinstance(on, str) and on.startswith("thread:"):
+            tid, _top = self._find_thread(on.split(":", 1)[1])
+            if tid == threading.main_thread().ident:
+                return self._main_executor()
+            return self._line_executor(tid)
+        raise ValueError(f"--on must be main, agent or thread:NAME, not {on!r}")
+
+    def _frame_executor(self, frame):
+        """Executor that runs on the thread owning ``frame``, while it is alive."""
+        for tid, frames in self._all_stacks():
+            if frame in frames:
+                if tid == threading.main_thread().ident:
+                    ex = self._main_executor()
+                    with ex.lock:
+                        if ex.mode is None:
+                            ex.mode = ex._pick_mode()
+                    if ex.mode == "loop":
+                        loop_code = ex.edge[0]
+                        idx = frames.index(frame)
+                        # the loop frame and its callers are alive between iterations
+                        if any(f.f_code is loop_code for f in frames[idx:]):
+                            return ex
+                    elif ex.mode in ("tk", "qt"):
+                        return ex
+                return self._line_executor(tid)
+        raise LookupError("frame has exited")
+
+    # -- arguments ------------------------------------------------------------------------
+    def _value(self, spec):
+        if not isinstance(spec, dict) or len(spec) != 1:
+            raise TypeError(f"bad argument spec {spec!r}")
+        if "lit" in spec:
+            try:
+                return ast.literal_eval(spec["lit"])
+            except (ValueError, SyntaxError):
+                raise TypeError(f"not a literal: {spec['lit']!r}") from None
+        if "path" in spec:
+            obj, _perm = self._resolve(spec["path"])
+            if isinstance(obj, inspector.NotEvaluated):
+                raise TypeError(f"{spec['path']} is a property; M2 doesn't evaluate properties "
+                                "to pass them as arguments")
+            return obj
+        raise TypeError(f"bad argument spec {spec!r}")
+
+    # -- permissions ----------------------------------------------------------------------
+    def _check_change(self, kind, parent, parent_perm, name, member=None):
+        """Raise PermissionError unless the scope lets us call/write ``parent.name``."""
+        if self.scope == "reachable":
+            return
+        key = "call" if kind == "call" else "write"
+        if parent_perm is not None:
+            v = parent_perm.get(key)
+            if kind == "write" and v is True:
+                return
+            if isinstance(v, list) and name in v:
+                return
+        if kind == "call" and member is not None:
+            perm = self._perm_for(member)
+            if perm is None and isinstance(member, types.MethodType):
+                perm = self._perm_for(member.__func__)
+            if perm is not None and perm.get("call") is True:
+                return
+        what = "calls" if kind == "call" else "changes"
+        raise PermissionError(f"{self.scope} scope: {name!r} is not allowlisted for {what} "
+                              "(see exposure.toml [expose] or exposure.expose())")
+
+    # -- jobs -------------------------------------------------------------------------------
+    def _run(self, fn, label, ex, timeout):
+        job = executor_mod.Job(fn, label, getattr(ex, "mode", None) or "agent")
+        self.jobs.add(job)
+        ex.submit(job)
+        job.done.wait(float(timeout) if timeout is not None else 10.0)
+        return job
+
+    def _job_report(self, job, perm_for_result=None):
+        out = {"job": job.id, "label": job.label, "state": job.state, "on": job.where}
+        if not job.done.is_set():
+            out["note"] = ("still running (or waiting for the target thread to run Python). "
+                           "Python can't stop a thread, so it will finish on its own; "
+                           f"check with `jobs` or `result {job.id}`")
+            return out
+        out["thread"] = job.thread
+        out["blocked_ms"] = job.blocked_ms
+        if job.ok:
+            value = job.result
+            if isinstance(value, _SetResult):
+                out["old"] = inspector.preview(value.old) if value.existed else "<unset>"
+                out["new"] = inspector.preview(value.new)
+                out["change"] = value.change_id
+            else:
+                out["result"] = self._entry("result", None, "result", value, perm_for_result)
+        else:
+            exc = job.exc
+            out["error"] = f"{type(exc).__name__}: {exc}"
+            out["traceback"] = job.tb
+            out["exception"] = self._entry("exception", None, "exception", exc,
+                                           perm_for_result)
+        return out
+
+    # -- call -------------------------------------------------------------------------------
+    def _resolve_callee(self, target):
+        """``(parent, perm, segment, member)``; parent None for a bare root."""
+        (rkind, rv), segs = paths.parse(target)
+        if not segs:
+            obj, perm = self._resolve(target)
+            return None, perm, None, obj
+        parent_text = (f"@{rv}" if rkind == "handle" else rv) + paths.format_segments(segs[:-1])
+        parent, perm = self._resolve(parent_text)
+        last = segs[-1]
+        if last[0] == "attr" and paths.is_dunder(last[1]):
+            raise inspector.AccessDenied(f"dunder attribute {last[1]!r} is not exposed")
+        try:
+            member = self._step_raw(parent, last)
+        except LookupError:
+            member = None
+        return parent, perm, last, member
+
+    def cmd_call(self, target, args=None, kwargs=None, on=None, timeout=10.0):
+        self._check_writable()
+        parent, perm, seg, member = self._resolve_callee(target)
+        if parent is None:
+            if self.scope != "reachable" and not (perm and perm.get("call") is True):
+                raise PermissionError(f"{self.scope} scope: {target!r} is not allowlisted "
+                                      "for calls")
+        else:
+            self._check_change("call", parent, perm, str(seg[1]), member)
+        a = [self._value(x) for x in (args or [])]
+        kw = {str(k): self._value(v) for k, v in (kwargs or {}).items()}
+        sys.audit("exposure.call", target)
+
+        if parent is None:
+            def fn(obj=member):
+                return obj(*a, **kw)
+        elif seg[0] == "attr":
+            def fn(parent=parent, name=seg[1]):
+                if isinstance(parent, types.FunctionType):
+                    cell = inspector.closure_cell(parent, name)
+                    if cell is not None:
+                        return cell.cell_contents(*a, **kw)
+                return getattr(parent, name)(*a, **kw)
+        else:
+            def fn(parent=parent, key=seg[1]):
+                return parent[key](*a, **kw)
+
+        job = self._run(fn, f"call {target}", self._executor(on), timeout)
+        result_perm = dict(READ_ONLY) if self.scope == "explicit" else None
+        return self._job_report(job, result_perm)
+
+    def cmd_do(self, action, args=None, kwargs=None, on=None, timeout=10.0):
+        """Run a named action from the policy's [actions] table."""
+        if not self.policy or action not in self.policy.actions:
+            known = sorted(self.policy.actions) if self.policy else []
+            raise LookupError(f"no action {action!r} (policy defines: {known})")
+        spec = self.policy.actions[action]
+        return self.cmd_call(spec["call"], args=args, kwargs=kwargs,
+                             on=on or spec.get("on"), timeout=timeout)
+
+    # -- set --------------------------------------------------------------------------------
+    def _plan_set(self, target):
+        """Work out what a set changes: ``(kind, container, key, perm, frame)``."""
+        (rkind, rv), segs = paths.parse(target)
+        if rkind == "handle" and not segs:
+            raise TypeError("can't rebind a handle; set an attribute or item of it")
+        if not segs:
+            return self._plan_root_set(rv)
+        last = segs[-1]
+        if last[0] == "attr" and paths.is_dunder(last[1]):
+            raise inspector.AccessDenied(f"dunder attribute {last[1]!r} is not exposed")
+        parent_text = (f"@{rv}" if rkind == "handle" else rv) + paths.format_segments(segs[:-1])
+        parent, perm = self._resolve(parent_text)
+        name = last[1]
+        self._check_change("write", parent, perm, str(name))
+        if isinstance(parent, types.FrameType):
+            if last[0] != "attr":
+                raise TypeError("frame locals are set by name: @frame.name")
+            return "local", parent, name, perm, parent
+        if isinstance(parent, types.FunctionType) and last[0] == "attr":
+            cell = inspector.closure_cell(parent, name)
+            if cell is not None:
+                return "cell", cell, name, perm, None
+        return ("attr" if last[0] == "attr" else "item"), parent, name, perm, None
+
+    def _plan_root_set(self, name):
+        explicit = self._explicit_items()
+        if self.scope != "reachable":
+            item = explicit.get(name)
+            label = item[0] if item else ""
+            if not item or not item[2].get("write") is True or not label.startswith("policy:"):
+                raise PermissionError(f"{self.scope} scope: rebinding {name!r} isn't "
+                                      "allowlisted (needs a policy rule with write = true)")
+            rule = next(r for r in self.policy.rules if f"policy:{r.key}" == label)
+            if rule.segments:
+                raise TypeError("set an attribute of an exposed object, not the object itself")
+            if rule.module == policy_mod.ENTRY:
+                frame = self._entry_frame()
+                return "local", frame, rule.root, item[2], frame
+            mod = sys.modules.get(rule.module or "__main__")
+            return "attr", mod, rule.root, item[2], None
+        frame = self._entry_frame()
+        if name in inspector.frame_locals(frame):
+            return "local", frame, name, None, frame
+        if name in frame.f_globals and not paths.is_dunder(name):
+            return "global", frame.f_globals, name, None, None
+        raise LookupError(f"{name!r} is not a local or global of the entry frame")
+
+    def _apply(self, kind, container, key, value, delete=False):
+        """Do one change on the executing thread; return (old, existed)."""
+        if kind == "attr":
+            existed = True
+            try:
+                old = getattr(container, key)
+            except AttributeError:
+                old, existed = None, False
+            if delete:
+                delattr(container, key)
+            else:
+                setattr(container, key, value)
+        elif kind == "item":
+            try:
+                old, existed = container[key], True
+            except (KeyError, IndexError):
+                old, existed = None, False
+            if delete:
+                del container[key]
+            else:
+                container[key] = value
+        elif kind == "global":
+            existed = key in container
+            old = container.get(key)
+            if delete:
+                container.pop(key, None)
+            else:
+                container[key] = value
+        elif kind == "local":
+            loc = container.f_locals          # PEP 667 write-through proxy
+            existed = key in loc
+            old = loc[key] if existed else None
+            if delete:
+                del loc[key]
+            else:
+                loc[key] = value
+        elif kind == "cell":
+            try:
+                old, existed = container.cell_contents, True
+            except ValueError:
+                old, existed = None, False
+            if delete:
+                del container.cell_contents
+            else:
+                container.cell_contents = value
+        else:  # pragma: no cover
+            raise ValueError(kind)
+        return old, existed
+
+    def cmd_set(self, target, value, on=None, timeout=10.0):
+        self._check_writable()
+        kind, container, key, _perm, frame = self._plan_set(target)
+        new = self._value(value)
+        sys.audit("exposure.set", target)
+        ex = self._frame_executor(frame) if frame is not None else self._executor(on)
+        self._change_ids += 1
+        cid = self._change_ids
+
+        def fn():
+            old, existed = self._apply(kind, container, key, new)
+            return _SetResult(old, existed, new, cid)
+
+        job = self._run(fn, f"set {target}", ex, timeout)
+        if job.done.is_set() and job.ok:
+            r = job.result
+            self.changes.append({"id": cid, "target": target, "kind": kind,
+                                 "container": container, "key": key, "old": r.old,
+                                 "existed": r.existed, "new": new, "frame": frame,
+                                 "on": on, "time": time.time(), "undone": False})
+            del self.changes[:-500]
+        return self._job_report(job)
+
+    def cmd_undo(self, n=1, timeout=10.0):
+        self._check_writable()
+        todo = [c for c in self.changes if not c["undone"]][-int(n):]
+        out = []
+        for c in reversed(todo):
+            frame = c["frame"]
+            try:
+                ex = self._frame_executor(frame) if frame is not None else self._executor(c["on"])
+            except LookupError as exc:
+                out.append({"change": c["id"], "target": c["target"], "error": str(exc)})
+                continue
+
+            def fn(c=c):
+                self._apply(c["kind"], c["container"], c["key"], c["old"],
+                            delete=not c["existed"])
+                return None
+
+            sys.audit("exposure.set", c["target"])
+            job = self._run(fn, f"undo {c['target']}", ex, timeout)
+            rep = {"change": c["id"], "target": c["target"], "state": job.state,
+                   "restored": inspector.preview(c["old"]) if c["existed"] else "<unset>"}
+            if job.done.is_set() and job.ok:
+                c["undone"] = True
+            elif job.done.is_set():
+                rep["error"] = f"{type(job.exc).__name__}: {job.exc}"
+            out.append(rep)
+        return {"undone": out}
+
+    def cmd_history(self, limit=50):
+        return [{"change": c["id"], "target": c["target"], "kind": c["kind"],
+                 "old": inspector.preview(c["old"]) if c["existed"] else "<unset>",
+                 "new": inspector.preview(c["new"]), "undone": c["undone"],
+                 "time": c["time"]} for c in self.changes[-int(limit):]]
+
+    # -- jobs, executors, frames ---------------------------------------------------------
+    def cmd_jobs(self):
+        now = time.time()
+        return [{"job": j.id, "label": j.label, "state": j.state, "on": j.where,
+                 "blocked_ms": j.blocked_ms, "age_s": round(now - j.created, 2)}
+                for j in self.jobs.all()[-50:]]
+
+    def cmd_result(self, job, timeout=0.0):
+        j = self.jobs.get(job)
+        if timeout:
+            j.done.wait(float(timeout))
+        return self._job_report(j)
+
+    def cmd_executors(self):
+        ex = self._main_executor()
+        with ex.lock:
+            if ex.mode is None:
+                try:
+                    ex.mode = ex._pick_mode()
+                except LookupError as exc:
+                    return {"main": {"error": str(exc)}}
+        out = {"main": ex.info()}
+        others = [e.info() for k, e in self.executors.items() if k[0] == "line"]
+        if others:
+            out["threads"] = others
+        return out
+
+    def cmd_frames(self, n=300, timeout=30.0):
+        ok, stamps = self._main_executor().sample(int(n), float(timeout))
+        diffs = sorted(b - a for a, b in zip(stamps, stamps[1:]))
+        if not diffs:
+            return {"completed": ok, "frames": 0}
+
+        def pct(p):
+            return round(diffs[min(len(diffs) - 1, int(p / 100 * (len(diffs) - 1)))] * 1000, 3)
+
+        mean = sum(diffs) / len(diffs)
+        return {"completed": ok, "frames": len(diffs), "mean_ms": round(mean * 1000, 3),
+                "median_ms": pct(50), "p95_ms": pct(95), "p99_ms": pct(99),
+                "max_ms": round(diffs[-1] * 1000, 3), "fps": round(1 / mean, 2) if mean else None}
+
+
+class _SetResult:
+    __slots__ = ("old", "existed", "new", "change_id")
+
+    def __init__(self, old, existed, new, change_id):
+        self.old, self.existed, self.new, self.change_id = old, existed, new, change_id
 
 
 # -- entry point used by the bootstrap -------------------------------------------------

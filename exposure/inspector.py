@@ -180,6 +180,13 @@ def get_attr(obj, name: str):
         if name in loc:
             return loc[name]
         raise LookupError(f"frame has no local {name!r}")
+    if isinstance(obj, types.FunctionType):
+        cell = closure_cell(obj, name)
+        if cell is not None:
+            try:
+                return cell.cell_contents
+            except ValueError:
+                raise LookupError(f"closure variable {name!r} is empty") from None
     if not isinstance(obj, type):
         d = instance_dict(obj)
         if d is not None and name in d:
@@ -207,6 +214,17 @@ def get_attr(obj, name: str):
             attr, (types.FunctionType, types.BuiltinFunctionType, type)):
         return NotEvaluated(attr, name)
     return attr
+
+
+def closure_cell(func, name):
+    """The closure cell for free variable ``name`` of ``func``, or None."""
+    code = func.__code__
+    cells = func.__closure__ or ()
+    if name in code.co_freevars:
+        i = code.co_freevars.index(name)
+        if i < len(cells):
+            return cells[i]
+    return None
 
 
 def _is_data_descriptor(attr) -> bool:
@@ -292,7 +310,7 @@ def children(obj, tick=_noop):
         for name, cell in zip(code.co_freevars, cells):
             tick()
             try:
-                out.append((name, None, "closure", cell.cell_contents))
+                out.append((name, ("attr", name), "closure", cell.cell_contents))
             except ValueError:
                 out.append((name, None, "closure", NotEvaluated(cell, name)))
         return out

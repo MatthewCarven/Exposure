@@ -75,7 +75,7 @@ def test_explicit_scope_from_code(make_target):
             with pytest.raises(RemoteError, match="explicit scope"):
                 c.ls(hidden)
         sc = c.scope()
-        assert sc["scope"] == "explicit" and sc["enforced"] == ["read"]
+        assert sc["scope"] == "explicit" and sc["enforced"] == ["read", "write", "call"]
         assert all("handle" not in f for f in c.stack()["frames"])
 
 

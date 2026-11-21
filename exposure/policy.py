@@ -54,6 +54,7 @@ class Policy:
     pressure: str | None = None
     rules: list[Rule] = field(default_factory=list)
     agent: dict = field(default_factory=dict)
+    actions: dict = field(default_factory=dict)   # name -> {"call": path, "on": ...}
 
 
 def _perm(value, key, what):
@@ -103,8 +104,26 @@ def parse(data: dict, path: str | None = None) -> Policy:
     if not isinstance(expose, dict):
         raise PolicyError("[expose] must be a table")
     rules = [parse_rule(k, v) for k, v in expose.items()]
+    actions = {}
+    raw_actions = data.get("actions", {}) or {}
+    if not isinstance(raw_actions, dict):
+        raise PolicyError("[actions] must be a table")
+    for name, spec in raw_actions.items():
+        if isinstance(spec, str):
+            spec = {"call": spec}
+        if not isinstance(spec, dict) or not isinstance(spec.get("call"), str):
+            raise PolicyError(f"[actions] {name}: needs call = \"path.to.callable\"")
+        on = spec.get("on")
+        if on is not None and on not in ("main", "agent") and not str(on).startswith("thread:"):
+            raise PolicyError(f"[actions] {name}: on must be main, agent or thread:NAME")
+        try:
+            paths.parse(spec["call"])
+        except paths.PathError as exc:
+            raise PolicyError(f"[actions] {name}: {exc}") from None
+        actions[name] = {"call": spec["call"], "on": on}
     return Policy(path=path, scope=scope, entry=agent.get("entry"),
-                  pressure=agent.get("pressure"), rules=rules, agent=dict(agent))
+                  pressure=agent.get("pressure"), rules=rules, agent=dict(agent),
+                  actions=actions)
 
 
 def load(path: str) -> Policy:

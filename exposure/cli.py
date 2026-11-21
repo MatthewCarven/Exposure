@@ -22,7 +22,8 @@ import sys
 from . import client as client_mod
 from . import procs
 
-ATTACH_OPTS = ("entry", "policy", "scope", "pressure", "duty", "wait")
+ATTACH_OPTS = ("entry", "policy", "scope", "pressure", "duty", "wait", "read_only",
+               "idle_timeout", "frame_budget_ms", "max_handles")
 
 
 def _attach_parent():
@@ -38,7 +39,24 @@ def _attach_parent():
     g.add_argument("--duty", type=float, help="max share of wall time the agent may be busy "
                                               "(default 0.25)")
     g.add_argument("--wait", type=float, default=10.0, help="seconds to wait for the target")
+    g.add_argument("--read-only", action="store_true", dest="read_only",
+                   help="refuse every call and set for this session")
+    g.add_argument("--idle-timeout", type=float, dest="idle_timeout",
+                   help="seconds without a client before the agent detaches itself "
+                        "(default 1800; 0 = never)")
+    g.add_argument("--frame-budget", type=float, dest="frame_budget_ms",
+                   help="ms of queued work per main-loop iteration (default 2)")
+    g.add_argument("--max-handles", type=int, dest="max_handles",
+                   help="handle table size before the least recently used are evicted "
+                        "(default 10000)")
     return p
+
+
+def _run_opts(p):
+    p.add_argument("--on", help="where it runs: main (default; between frames), agent "
+                                "(a worker thread), or thread:NAME")
+    p.add_argument("--timeout", type=float, help="seconds to wait (default 10); the job keeps "
+                                                 "running after a timeout")
 
 
 def build_parser():
@@ -66,6 +84,29 @@ def build_parser():
     s = sub.add_parser("release", parents=[parent])
     s.add_argument("handles", nargs="*")
     sub.add_parser("detach", parents=[parent])
+    # M2
+    s = sub.add_parser("call", parents=[parent], help="call a function or method")
+    s.add_argument("expr", help='e.g. \'self._mirror_param(2, "gain", 0.1)\'')
+    _run_opts(s)
+    s = sub.add_parser("set", parents=[parent], help="set a variable, attribute or item")
+    s.add_argument("target", help="path, e.g. config.debug or @3[0], or 'path = value'")
+    s.add_argument("value", nargs="?", help="literal, name or handle (strings need quotes)")
+    _run_opts(s)
+    s = sub.add_parser("do", parents=[parent], help="run a named action from exposure.toml")
+    s.add_argument("action")
+    s.add_argument("values", nargs="*")
+    _run_opts(s)
+    s = sub.add_parser("undo", parents=[parent], help="revert the last N sets")
+    s.add_argument("n", nargs="?", type=int, default=1)
+    s = sub.add_parser("history", parents=[parent], help="list changes made this session")
+    s.add_argument("--limit", type=int)
+    sub.add_parser("jobs", parents=[parent], help="recent calls and sets")
+    s = sub.add_parser("result", parents=[parent], help="result of a job")
+    s.add_argument("job", type=int)
+    s.add_argument("--timeout", type=float, help="wait up to this long for it to finish")
+    sub.add_parser("executors", parents=[parent], help="how work reaches each thread")
+    s = sub.add_parser("frames", parents=[parent], help="main-loop iteration time stats")
+    s.add_argument("n", nargs="?", type=int, default=300)
     return ap
 
 
@@ -116,6 +157,24 @@ def print_ls(res):
         print(f"... {res['total'] - nxt} more (use --offset {nxt})")
 
 
+def print_job(res):
+    head = f"job {res['job']} {res['state']}"
+    if res.get("thread"):
+        head += f" on {res['thread']} ({res['on']}), blocked {res['blocked_ms']} ms"
+    print(head)
+    if "result" in res:
+        r = res["result"]
+        print(f"  -> {r.get('handle', '')} {r['preview']}".replace("->  ", "-> "))
+    if "new" in res:
+        print(f"  {res['old']}  ->  {res['new']}   (change {res['change']}; `undo` reverts)")
+    if "error" in res:
+        print(f"  raised {res['error']}  {res['exception'].get('handle', '')}")
+        if res.get("traceback"):
+            print("  " + res["traceback"].rstrip().replace("\n", "\n  "))
+    if "note" in res:
+        print(f"  {res['note']}")
+
+
 def print_result(cmd, res):
     if cmd == "ls":
         print_ls(res)
@@ -130,6 +189,19 @@ def print_result(cmd, res):
     elif cmd == "ps":
         _table([(p.pid, p.version or "?", p.attachable, p.name, p.exe or p.cmdline or "")
                 for p in res], ["pid", "python", "attachable", "name", "exe"])
+    elif cmd in ("call", "set", "do", "result"):
+        print_job(res)
+    elif cmd == "history":
+        _table([(h["change"], h["target"], h["old"], h["new"], "undone" if h["undone"] else "")
+                for h in res], ["change", "target", "old", "new", ""])
+    elif cmd == "jobs":
+        _table([(j["job"], j["state"], j["on"], j["blocked_ms"] if j["blocked_ms"] is not None
+                 else "", j["label"]) for j in res], ["job", "state", "on", "blocked ms", "what"])
+    elif cmd == "undo":
+        for u in res["undone"]:
+            extra = f"  error: {u['error']}" if "error" in u else ""
+            print(f"change {u['change']}: {u['target']} -> {u.get('restored')} "
+                  f"[{u.get('state', 'failed')}]{extra}")
     elif cmd == "sessions":
         if not res:
             print("no sessions")
@@ -191,6 +263,27 @@ def main(argv=None) -> int:
                 res = c.release(args.handles or None)
             elif args.cmd == "detach":
                 res = c.detach()
+            elif args.cmd == "call":
+                res = c.call(args.expr, on=args.on, timeout=args.timeout)
+            elif args.cmd == "set":
+                if args.value is None:
+                    res = c.assign(args.target, on=args.on, timeout=args.timeout)
+                else:
+                    res = c.set(args.target, args.value, on=args.on, timeout=args.timeout)
+            elif args.cmd == "do":
+                res = c.do(args.action, *args.values, on=args.on, timeout=args.timeout)
+            elif args.cmd == "undo":
+                res = c.undo(args.n)
+            elif args.cmd == "history":
+                res = c.history(args.limit)
+            elif args.cmd == "jobs":
+                res = c.jobs()
+            elif args.cmd == "result":
+                res = c.result(args.job, args.timeout)
+            elif args.cmd == "executors":
+                res = c.executors()
+            elif args.cmd == "frames":
+                res = c.frames(args.n)
             else:  # pragma: no cover
                 raise SystemExit(f"unknown command {args.cmd}")
         if args.json:

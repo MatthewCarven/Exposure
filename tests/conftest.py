@@ -1,5 +1,6 @@
 import os
 import queue
+import site
 import subprocess
 import sys
 import threading
@@ -36,11 +37,14 @@ def private_session_dir(tmp_path_factory):
 
 
 class Target:
-    def __init__(self, *args, cwd=None):
+    def __init__(self, *args, cwd=None, script="app_main.py"):
+        env = dict(os.environ, PYTHONDONTWRITEBYTECODE="1", QT_QPA_PLATFORM="offscreen")
+        # let the base interpreter see this venv's packages (PySide6 for the Qt target)
+        env["PYTHONPATH"] = os.pathsep.join([*site.getsitepackages(),
+                                             env.get("PYTHONPATH", "")]).rstrip(os.pathsep)
         self.proc = subprocess.Popen(
-            [target_python(), os.path.join(TARGETS, "app_main.py"), *args],
-            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cwd,
-            env=dict(os.environ, PYTHONDONTWRITEBYTECODE="1"))
+            [target_python(), os.path.join(TARGETS, script), *args],
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True, cwd=cwd, env=env)
         self.lines = queue.Queue()
         threading.Thread(target=self._pump, daemon=True).start()
         self.output = []
