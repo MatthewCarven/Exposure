@@ -221,6 +221,9 @@ class Agent:
         self.changes = []             # undo log / history, oldest first
         self._change_ids = 0
         self.idle_detached = False
+        self._conn_seq = 0
+        self._open_conns = 0
+        self._conns = set()
         self.policy = None
         self.policy_error = None
         self._load_policy()
@@ -284,6 +287,11 @@ class Agent:
             self.sock.close()
         except BaseException:
             pass
+        for conn in list(self._conns):   # other clients: drop them too
+            try:
+                conn.close()
+            except BaseException:
+                pass
         self._remove_files()
         try:
             atexit.unregister(self._remove_files)
@@ -303,25 +311,37 @@ class Agent:
                     conn, _addr = self.sock.accept()
                 except socket.timeout:
                     if (self.idle_timeout and time.time() - self.last_activity > self.idle_timeout
-                            and not self.jobs.pending()):
+                            and not self.jobs.pending() and not self._open_conns):
                         self.idle_detached = True
                         break   # abandoned session: tidy up as if detached
                     continue
                 except OSError:
                     break
-                try:
-                    self._handle_conn(conn)
-                except BaseException:
-                    pass
-                finally:
-                    try:
-                        conn.close()
-                    except BaseException:
-                        pass
+                # one thread per connection, so a long request (frames, a slow
+                # call) doesn't hold up another client
+                self._conn_seq += 1
+                threading.Thread(target=self._conn_thread, args=(conn,), daemon=True,
+                                 name=f"exposure-conn-{self._conn_seq}").start()
         except BaseException:
             pass
         finally:
             self._cleanup()
+
+    def _conn_thread(self, conn):
+        self._open_conns += 1
+        self._conns.add(conn)
+        try:
+            self._handle_conn(conn)
+        except BaseException:
+            pass
+        finally:
+            self._open_conns -= 1
+            self._conns.discard(conn)
+            self.last_activity = time.time()
+            try:
+                conn.close()
+            except BaseException:
+                pass
 
     def _handle_conn(self, conn):
         conn.settimeout(min(300.0, self.idle_timeout) if self.idle_timeout else 300.0)
@@ -473,9 +493,12 @@ class Agent:
         """``[(thread_ident, [frames outermost-first])]``, main thread first."""
         main = threading.main_thread().ident
         stacks = []
+        ours = {t.ident for t in threading.enumerate()
+                if t.name == "exposure-agent" or t.name.startswith("exposure-conn-")}
+        ours.add(threading.get_ident())
         for tid, top in sys._current_frames().items():
-            if tid == threading.get_ident():
-                continue  # our own thread
+            if tid in ours:
+                continue  # the agent's own threads
             frames = []
             f = top
             while f is not None:

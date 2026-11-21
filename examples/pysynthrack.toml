@@ -1,0 +1,23 @@
+# Exposure policy for PySynthRack. Pass it with --policy, or copy it next to
+# the program as exposure.toml (Exposure looks next to the main script and in
+# the working directory).
+#
+#   exposure ls PID self.patch.modules --policy examples/pysynthrack.toml
+#   exposure do PID param 1 '"amp"' 0.1
+#   exposure do PID audio
+
+[agent]
+entry = "pysynthrack.ui.app:App.run"   # App is created inline; its run() frame holds self
+scope = "both"                         # browse everything, change only what's below
+pressure = "<entry>:self.backend._xruns"   # back off if the audio starts dropping out
+
+[expose]
+"<entry>:self.patch" = { read = true }
+"<entry>:self.backend" = { read = true }
+# _mirror_param writes the model, tells the backend and moves the widget.
+"<entry>:self._mirror_param" = { call = true }
+"<entry>:self._on_toggle_audio" = { call = true }
+
+[actions]
+param = "self._mirror_param"     # param MODULE_ID "NAME" VALUE
+audio = "self._on_toggle_audio"  # start / stop audio

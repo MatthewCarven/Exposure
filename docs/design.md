@@ -332,6 +332,29 @@ Done. Full write-up in `docs/M1-results.md`.
 - **Carried to M2**: handle-table growth (weak refs or a cap), and an idle
   timeout for abandoned sessions.
 
+### M2 results (21 Nov 2026)
+
+Done. Full write-up in `docs/M2-results.md`.
+- **Commands**: `call`, `set`, `do` (policy `[actions]`), `undo`, `history`,
+  `jobs`, `result`, `executors`, `frames`.
+- **Main executor**: found PySynthRack's `App.run` loop by itself, using a
+  `sys.monitoring` JUMP hook on the loop's back-edge rather than a fixed line.
+  Tkinter (`after` from the agent thread) and Qt (a queued signal to a helper
+  QObject) work on Windows and Linux. Anything else falls back to the next
+  line.
+- **Per job**: a 2 ms per-frame budget, the time it blocked the thread, and
+  timeouts that leave the job running behind a job id. Results and exceptions
+  become handles.
+- **Permissions**: write/call enforced in the explicit and both scopes,
+  `--read-only`, and `sys.audit` events. The handle table is LRU-capped, and
+  an idle timeout tidies up abandoned sessions.
+- **PySynthRack with audio on**: 300 `_mirror_param` calls on the main loop
+  and 300 agent-executor calls caused 0 xruns. Frame p99 was 8.2 ms against
+  7.9 ms idle. A Meter module confirmed the level change: 0.300 → 0.100.
+- **Found in PySynthRack, not fixed**: `_clear_editor` leaves stale
+  `_param_widgets` entries, so after loading a patch `_mirror_param` updates a
+  deleted widget and the slider doesn't move.
+
 ## 8. Risks
 
 - **Blocked targets** (stuck in C) won't accept injection until they wake. Mitigation: clear messaging; the opt-in `serve()` path; document that most event-loop programs wake often enough.

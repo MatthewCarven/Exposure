@@ -16,7 +16,8 @@ From the command line you can then:
 
 ## Status
 
-Early, and read-only so far.
+Early: reading, calling and setting work; the game tools and the REPL come
+next.
 
 - **M0 spike, done.** It proved the approach on PySynthRack, a modular
   synthesiser built on DearPyGui and sounddevice: attach in about 50-80 ms, a
@@ -28,6 +29,12 @@ Early, and read-only so far.
   (35,000 in 11 s), caused 0 audio dropouts and left the frame time unchanged.
   Details: [`docs/M1-results.md`](docs/M1-results.md). The design is in
   [`docs/design.md`](docs/design.md).
+- **M2 calls and sets, done.** Calls and sets run on the program's own main
+  loop between frames. Exposure finds Python game loops, Tkinter and Qt by
+  itself. M2 also adds undo, background jobs and allowlist enforcement. On
+  PySynthRack, 300 parameter changes made through `call` caused 0 dropouts,
+  and a level meter confirmed the change in the audio itself. Details:
+  [`docs/M2-results.md`](docs/M2-results.md).
 
 ## Requirements
 
@@ -53,6 +60,41 @@ exposure threads 41872
 exposure stack 41872 worker-1
 exposure detach 41872
 ```
+
+### Changing things (M2)
+
+```
+exposure call 41872 'player.heal(5, cap=200)'     # runs on the main loop, between frames
+exposure call 41872 'save_game()' --on agent      # or on a worker thread
+exposure set 41872 player.speed 2.5
+exposure set 41872 'settings["volume"] = 0.8'
+exposure set 41872 mode '"turbo"'                 # a local in the running main()
+exposure undo 41872                               # put the last change back
+exposure history 41872
+exposure jobs 41872                               # calls that outlived --timeout
+exposure frames 41872 300                         # main-loop frame-time stats
+```
+
+Arguments and values can be literals, names, handles (`@3`), and `.attr` /
+`[key]` steps on them. Strings need their quotes, which in a shell means
+wrapping them: `'"turbo"'`. Arbitrary expressions arrive with `eval` in M4.
+
+Calls and sets go to the main thread by default, the place GUI and game code
+expects to be touched. Exposure works out how to get there:
+
+- a Python game loop: between iterations, through a `sys.monitoring` hook on
+  the loop's back-edge;
+- Tkinter: `after`;
+- Qt: a queued signal.
+
+Each job reports how long it blocked the frame, and queued work gets 2 ms per
+frame (`--frame-budget`). A call that runs past `--timeout` keeps going in the
+background, because Python can't stop a thread: check it with `jobs` and
+`result`.
+
+`--read-only` refuses every call and set. Each call and set also raises a
+`sys.audit` event (`exposure.call`, `exposure.set`) that the program's own
+audit hooks can see or block.
 
 The entry frame is `main` by default. Pass `--entry App.run` (or
 `module:qualname`) for programs whose state lives elsewhere. Every non-trivial
@@ -96,17 +138,26 @@ import exposure
 exposure.expose(config, name="config", writable=["debug"])
 ```
 
-`reachable` shows everything reachable from the entry frame. `explicit` shows
-only the listed items and what they hold. `both` browses everything but marks
-the listed items with their permissions. M1 enforces `read`; `write` and
-`call` take effect from M2.
+`reachable` shows everything reachable from the entry frame and allows any
+call or set. `explicit` shows only the listed items and what they hold, and
+`both` browses everything. In those two, calls and sets are allowed only where
+the policy grants `write` (true, or a list of attribute names) or `call` (true,
+or a list of methods).
+
+The policy can also name actions, so a common change becomes one short
+command. [`examples/pysynthrack.toml`](examples/pysynthrack.toml) is a full
+example:
+
+```toml
+[actions]
+param = "self._mirror_param"       # exposure do PID param 1 '"amp"' 0.1
+audio = "self._on_toggle_audio"    # exposure do PID audio
+```
 
 ## The M0 spike
 
-The spike in [`spike/`](spike/) also has the commands that M2 will turn into
-proper features: running code on the target's main loop (`eval_main`),
-frame-time measurement, and PySynthRack-specific audio and param commands.
-Run `python spike/client.py <pid> <command> [key=value ...]`; see
+The spike in [`spike/`](spike/) is the M0 prototype, kept for reference along
+with the scripts that drove the M1 and M2 PySynthRack checks. See
 [`spike/M0-results.md`](spike/M0-results.md).
 
 On Windows, a venv's `Scripts\python.exe` is a launcher that re-spawns the real
@@ -118,7 +169,7 @@ client says so instead of hanging.
 ## Roadmap
 
 - **M1**: read-only attach with an allowlist scope. Done.
-- **M2**: function calls and variable sets on the main loop.
+- **M2**: function calls and variable sets on the main loop. Done.
 - **M3**: tools for games and GUIs: watch, tweak, pause and step.
 - **M4**: interactive REPL.
 - **M5**: hardening.

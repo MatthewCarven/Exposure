@@ -20,7 +20,7 @@ import json
 import sys
 
 from . import client as client_mod
-from . import procs
+from . import exprs, paths, procs
 
 ATTACH_OPTS = ("entry", "policy", "scope", "pressure", "duty", "wait", "read_only",
                "idle_timeout", "frame_budget_ms", "max_handles")
@@ -292,6 +292,9 @@ def main(argv=None) -> int:
             print_result(args.cmd, res)
         return 0
     except client_mod.AttachError as exc:
+        print(f"exposure: {exc}", file=sys.stderr)
+        return 2
+    except (exprs.ExprError, paths.PathError) as exc:
         print(f"exposure: {exc}", file=sys.stderr)
         return 2
     except client_mod.RemoteError as exc:

@@ -57,6 +57,27 @@ def test_calls_run_between_frames(make_target):
 
 
 @needs_314
+def test_two_clients_at_once(make_target):
+    import threading
+    t = make_target(script="game_loop.py")
+    Client.attach(t.pid).close()
+    out = {}
+
+    def sample():
+        with Client.attach(t.pid) as c:
+            out["frames"] = c.frames(150)
+
+    th = threading.Thread(target=sample)
+    th.start()
+    time.sleep(0.1)
+    with Client.attach(t.pid) as c:
+        for i in range(30):
+            assert c.call(f"player.heal({i % 3})")["state"] == "done"
+    th.join(30)
+    assert out["frames"]["completed"] and out["frames"]["frames"] == 150
+
+
+@needs_314
 def test_sets_and_undo(make_target):
     t = make_target(script="game_loop.py")
     with Client.attach(t.pid) as c:
@@ -210,9 +231,27 @@ def test_tk_executor(make_target):
         assert c.call('label.cget("text")')["result"]["preview"] == "'changed'"
 
 
+def _qt_usable():
+    """PySide6 importable *and* its Qt libraries loadable (e.g. libEGL on Linux)."""
+    if importlib.util.find_spec("PySide6") is None:
+        return False
+    import site
+    import subprocess
+    from conftest import target_python
+    env = dict(os.environ, QT_QPA_PLATFORM="offscreen",
+               PYTHONPATH=os.pathsep.join(site.getsitepackages()))
+    try:
+        r = subprocess.run([target_python(), "-c", "from PySide6.QtWidgets import QApplication"],
+                           env=env, capture_output=True, timeout=120)
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return r.returncode == 0
+
+
 @needs_314
-@pytest.mark.skipif(importlib.util.find_spec("PySide6") is None,
-                    reason="needs PySide6 (pip install PySide6-Essentials)")
+@pytest.mark.skipif(not _qt_usable(),
+                    reason="needs a working PySide6 (pip install PySide6-Essentials, plus "
+                           "Qt's system libraries)")
 def test_qt_executor(make_target):
     t = make_target(script="qt_app.py")
     with Client.attach(t.pid) as c:
